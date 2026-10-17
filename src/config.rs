@@ -4486,6 +4486,27 @@ mod tests {
         assert_eq!(c.default_layer().unwrap().id, "main");
     }
 
+    #[test]
+    fn the_example_config_has_no_virtual_esc() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let c = Config::load(&root.join("config.example.toml")).unwrap();
+        let items = &c.default_layer().unwrap().items;
+        assert!(
+            !items.iter().any(|i| i.id() == Some("esc")),
+            "the example still has the virtual Esc button"
+        );
+    }
+
+    #[test]
+    fn the_example_config_uses_the_kwin_action() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = fs::read_to_string(root.join("config.example.toml")).unwrap();
+        assert!(
+            text.contains("type = \"kwin\""),
+            "the example demonstrates no kwin action"
+        );
+    }
+
     /// The workspaces item commented out in the example is valid once uncommented.
     #[test]
     fn example_workspaces_is_valid() {

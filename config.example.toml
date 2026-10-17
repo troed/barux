@@ -148,14 +148,8 @@ gap = 12
 # Pressing still shows a highlight in the item's outline without a background.
 # item_radius = "full"
 
-# Many Touch Bar MacBooks have no physical Esc key.
-[[layers.items]]
-type = "button"
-id = "esc"
-label = "esc"
-width = 100
-action = { type = "key", key = "KEY_ESC" }
-
+# (The button that used to sit here — a virtual Esc — is dropped: the target
+#  machine has a physical Esc key to the left of the bar.)
 [[layers.items]]
 type = "spacer"
 
@@ -373,8 +367,9 @@ format = "%H:%M"
 # thumb_size = 44                  # thumbnails' height, px (default: the row's)
 # active_color = "#00ffb750"       # behind the chosen GIF's thumbnail
 
-# Hyprland's workspaces as capsules (needs Hyprland: without it, the item isn't
-# drawn and takes no room). style = "dots" (default): inactive, a dot; active, a
+# Workspaces as capsules (needs a desktop: Hyprland, or KWin on Plasma 6 — without
+# it, the item isn't drawn and takes no room). style = "dots" (default): inactive,
+# a dot; active, a
 # pill dot_size high and active_width long, in active_color. style = "capsule":
 # inactive, a horizontal bar; active, the same turned upright. Beside a capsule a strip of its windows' icons
 # opens (strip = "active": the active one's; "pressed": under the finger; "all";
@@ -613,12 +608,15 @@ format = "%H:%M"
 
 # More examples, commented out (see "Recipes" in docs/GUIDE.md):
 #
-# Open an app through Hyprland (it keeps running after the tap):
+# Open an app through KWin (it keeps running after the tap):
 # [[layers.items]]
 # type = "button"
 # id = "terminal"
 # icon = "utilities-terminal"          # a name from your icon theme
-# action = { type = "hyprctl", exec = ["kitty"] }
+# action = { type = "kwin", exec = ["kitty"] }
+#
+# Toggle KWin's Overview from a workspaces drag (Plasma 6):
+# overview_action = { type = "kwin", overview = true }
 #
 # Run a command, as run_as, without a shell:
 # [[layers.items]]

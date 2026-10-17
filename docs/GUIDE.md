@@ -2279,6 +2279,39 @@ hyprctl clients -j | jq -r '.[] | .class' | sort -u
 switching windows: `--focus-class <clase>` (see
 [section 10](#preview-without-touching-the-bar---png)).
 
+### On KDE (Plasma 6 / KWin)
+
+The desktop-aware items — `workspaces` (the capsules and their window-icon strip),
+the per-app buttons (`app_actions`) and `app_keys` — also work under **Plasma 6 on
+Wayland (KWin)**. The desktop source is fixed at build time: this branch talks to
+KWin, and the Hyprland modules are kept in the tree so `main` merges forward. There
+is no `desktop = "kde"` setting and no runtime detection.
+
+**The KWin script.** KWin exposes no window list over D-Bus by itself, so barux ships
+a small KWin script (`dist/kwin-script/`, id `org.barux.desktop`) that reports the
+virtual desktops and the window list to barux over the session bus. `install.sh`
+installs it to `~/.local/share/kwin/scripts/org.barux.desktop/`, enables it in
+`kwinrc` (`[Plugins]` `org.barux.desktopEnabled=true`) and asks KWin to reconfigure;
+it is **per-user** (no sudo). `uninstall.sh` removes it and its `kwinrc` entry. To
+disable it by hand: delete that directory and the key under `[Plugins]`, then run
+`qdbus6 org.kde.KWin /KWin reconfigure`. What is verified on a machine is recorded
+in `docs/kwin-notes.md`.
+
+**Reading a window's class on KDE.** `app_actions`, `class_icons` and `app_keys`
+match KWin's `resourceClass`, lower-cased, with `resourceName`/`desktopFileName` as
+fallbacks for windows that carry none. That is the counterpart of the Hyprland
+`hyprctl clients -j | jq -r '.[] | .class'` above — the values differ for some apps,
+so read them from the script's snapshots (or KWin's own tools) on your machine.
+
+**Actions.** The `kwin` action replaces `hyprctl` for KDE users: switch virtual
+desktop (`desktop = 2`), focus a window (`focus_window = "<id>"`), launch an
+application (`exec = ["kitty"]`) or toggle KWin's Overview (`overview = true`). A
+`workspaces` item's drag usually uses
+`overview_action = { type = "kwin", overview = true }`.
+
+**Going back to tiny-dfr** is exactly [section 5](#5-going-back-to-tiny-dfr-and-recovering-the-bar);
+the KWin script is unrelated to the Touch Bar and is removed by `uninstall.sh`.
+
 ## 7. Recipes
 
 Each recipe is an item to add to `[[layers.items]]`; afterwards,
