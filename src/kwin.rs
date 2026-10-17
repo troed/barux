@@ -27,8 +27,6 @@ const VDM_IFACE: &str = "org.kde.KWin.VirtualDesktopManager";
 /// A loaded script's own object: `run` lives here, not on `/Scripting`.
 const SCRIPT_PATH_PREFIX: &str = "/Scripting/Script";
 const SCRIPT_IFACE: &str = "org.kde.kwin.Script";
-/// The plugin name barux loads its generated one-shot focus scripts under.
-const FOCUS_PLUGIN: &str = "barux-focus";
 /// Any of these means the desktop list may have changed: re-read it (event-driven;
 /// no timer). `currentChanged` is the switch; the rest are add/remove/rename.
 const VDM_SIGNALS: [&str; 4] = [
@@ -50,10 +48,16 @@ const KGLOBALACCEL_PATH: &str = "/component/kwin";
 const KGLOBALACCEL_IFACE: &str = "org.kde.kglobalaccel.Component";
 
 /// A KWin window id as the bar sends it: the KWin script's `internalId`, a
-/// UUID-like string (`docs/kwin-notes.md` §2, UNSURE). Any non-empty, printable,
-/// whitespace-free id up to 64 bytes is accepted; the rest is rejected.
+/// UUID-like string (`docs/kwin-notes.md` §2). Kept to `[A-Za-z0-9._-]`, ≤ 64
+/// bytes: the id also names the generated focus script (a file the daemon writes
+/// and a KWin plugin name), so anything else is refused.
 pub fn window_arg(id: &str) -> Result<String> {
-    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if !ok {
         bail!("bad window id {id:?}");
     }
     Ok(id.to_string())
@@ -282,10 +286,13 @@ impl Kwin {
         std::fs::write(&path, focus_script(&addr))
             .with_context(|| format!("writing {}", path.display()))?;
         let path = path.to_string_lossy().to_string();
-        // `loadScript(filePath, pluginName)` returns the script's id; `run` lives on
-        // that script's own object (`org.kde.kwin.Script`), not on `/Scripting`.
+        // `loadScript(filePath, pluginName)` returns the script's id (or -1 if that
+        // plugin name is already loaded); `run` lives on the script's own object.
+        // A unique plugin name per tap keeps this from clashing with a script that
+        // failed to unload.
+        let plugin = format!("barux-focus-{addr}");
         let id: i32 = Proxy::new(bus.connection(), DEST, SCRIPTING_PATH, SCRIPTING_IFACE)?
-            .call("loadScript", &(path.as_str(), FOCUS_PLUGIN))?;
+            .call("loadScript", &(path.as_str(), plugin.as_str()))?;
         let script_path = format!("{SCRIPT_PATH_PREFIX}{id}");
         if let Err(e) = Proxy::new(bus.connection(), DEST, script_path.as_str(), SCRIPT_IFACE)
             .and_then(|p| p.call::<_, _, ()>("run", &()))
@@ -297,7 +304,7 @@ impl Kwin {
             SCRIPTING_PATH,
             SCRIPTING_IFACE,
             "unloadScript",
-            &[Value::from(FOCUS_PLUGIN)],
+            &[Value::from(plugin.as_str())],
         ) {
             eprintln!("desktop: unloading the focus script: {e:#}");
         }
@@ -798,7 +805,7 @@ mod tests {
     fn a_window_id_is_the_scripts_internal_id() {
         assert_eq!(window_arg("a1").unwrap(), "a1");
         assert!(window_arg("60c2a5b0-8f3e-4a1c-9d2e-0f1a2b3c4d5e").is_ok());
-        for bad in ["", "two words", "line\nbreak", &"x".repeat(65)] {
+        for bad in ["", "two words", "line\nbreak", "/etc/passwd", "a/b", &"x".repeat(65)] {
             assert!(window_arg(bad).is_err(), "accepted {bad:?}");
         }
     }
