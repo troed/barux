@@ -81,6 +81,11 @@ impl Bus {
         })
     }
 
+    /// The underlying connection, for building typed `zbus` proxies.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// The wake pipe: readable (`EPOLLIN`) once a notice is queued.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.shared.wake.as_fd()
