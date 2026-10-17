@@ -51,6 +51,19 @@ impl Shared {
     }
 }
 
+/// A clonable handle that queues [`Notice`]s for the main loop, for objects the bus
+/// serves (the KWin script's `Snapshot`).
+#[derive(Clone)]
+pub struct Notifier {
+    shared: Arc<Shared>,
+}
+
+impl Notifier {
+    pub fn push(&self, notice: Notice) {
+        self.shared.push(notice);
+    }
+}
+
 /// A `zbus` connection to the session user's bus, with a wake pipe for epoll.
 pub struct Bus {
     conn: Connection,
@@ -84,6 +97,13 @@ impl Bus {
     /// The underlying connection, for building typed `zbus` proxies.
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// A handle to queue notices from an object the bus serves.
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// The wake pipe: readable (`EPOLLIN`) once a notice is queued.

@@ -3,11 +3,20 @@
 // KWin exposes no window list over D-Bus by itself, so barux ships this script:
 // KWin loads it, and on every change it pushes a JSON snapshot of the virtual
 // desktops and the window list to the name barux registers on the session bus
-// (org.barux.KWin). This file is installed by install.sh (see Task 10); it is the
-// probe shape from Task 1 — Task 4 narrows it to the final wire shape.
+// (org.barux.KWin, object /KWin, method Snapshot). install.sh installs and enables
+// it (see Task 10); docs/kwin-notes.md records what is verified on the machine.
+//
+// Snapshot shape (the wire contract; see src/kwin.rs's Snapshot struct):
+//   {
+//     "desktops": [ { "position": <int, 1-based>, "name": <string> } ],
+//     "current":  <int, the current desktop position>,
+//     "windows":  [ { "id": <string>, "class": <string>,
+//                     "title": <string>, "desktop": <int> } ],
+//     "focused":  <string id> | null
+//   }
 
 var BARUX_SERVICE = "org.barux.KWin";
-var BARUX_PATH = "/probe";
+var BARUX_PATH = "/KWin";
 var BARUX_IFACE = "org.barux.KWin";
 
 // The virtual desktops, by position (1-based) and name.
@@ -20,14 +29,18 @@ function desktopList() {
     return out;
 }
 
-// The positions of the desktops a window is on (Plasma allows more than one).
-function windowDesktops(win) {
-    var out = [];
+// The desktop a window is filed under: the first of its desktops, else 0.
+function windowDesktop(win) {
     var desktops = win.desktops || [];
-    for (var i = 0; i < desktops.length; i++) {
-        out.push(desktops[i].x11DesktopNumber);
-    }
-    return out;
+    return desktops.length > 0 ? desktops[0].x11DesktopNumber : 0;
+}
+
+// The class barux matches on: KWin's resourceClass, with resourceName and the
+// desktop file as fallbacks for windows that carry none, lower-cased so it lines
+// up with Hyprland-style config values (design §6.2).
+function windowClass(win) {
+    var cls = win.resourceClass || win.resourceName || win.desktopFileName || "";
+    return String(cls).toLowerCase();
 }
 
 function currentPosition() {
@@ -39,21 +52,18 @@ function focusedId() {
     return active ? String(active.internalId) : null;
 }
 
-// One full snapshot: every window with the fields barux's strip needs, plus the
-// desktop list and the focused window's id.
+// One full snapshot: every window with the fields barux's strip needs, the desktop
+// list, and the focused window's id.
 function snapshot() {
     var windows = [];
     var list = workspace.windowList();
     for (var i = 0; i < list.length; i++) {
         var w = list[i];
         windows.push({
-            internalId: String(w.internalId),
-            resourceClass: w.resourceClass || "",
-            resourceName: w.resourceName || "",
-            desktopFileName: w.desktopFileName || "",
-            caption: w.caption || "",
-            desktops: windowDesktops(w),
-            active: !!w.active,
+            id: String(w.internalId),
+            class: windowClass(w),
+            title: w.caption || "",
+            desktop: windowDesktop(w),
         });
     }
     return {
@@ -66,12 +76,11 @@ function snapshot() {
 
 function send() {
     var json = JSON.stringify(snapshot());
-    console.log("barux snapshot " + json);
     callDBus(BARUX_SERVICE, BARUX_PATH, BARUX_IFACE, "Snapshot", json);
 }
 
-// Per-window desktopsChanged is not a workspace signal: wire it on the window,
-// and unwire it when the window goes away so the closures do not accumulate.
+// Per-window desktopsChanged is not a workspace signal: wire it on the window, and
+// unwire it when the window goes away so the closures do not accumulate.
 function watch(win) {
     win.desktopsChanged.connect(send);
 }

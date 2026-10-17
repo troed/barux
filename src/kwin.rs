@@ -7,11 +7,12 @@
 //! neutral name, so `WsView::from_state`, the `workspaces` state machine,
 //! `appkeys` and `scenes` are untouched by the move off Hyprland.
 
-use crate::dbus::Bus;
-use crate::hypr::{HyprState as DesktopState, ReadOutcome};
+use crate::dbus::{Bus, Notice, Notifier};
+use crate::hypr::{HyprState as DesktopState, ReadOutcome, Window};
 use crate::hyprctl::ConfigProvider;
 use crate::user::{HyprEnv, SessionUser};
 use anyhow::{Result, anyhow, bail};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::os::fd::BorrowedFd;
 use zbus::blocking::Proxy;
@@ -30,6 +31,10 @@ const VDM_SIGNALS: [&str; 4] = [
     "desktopRemoved",
     "desktopDataChanged",
 ];
+/// What barux serves the KWin script on: the script calls `Snapshot(json)` here.
+const BARUX_NAME: &str = "org.barux.KWin";
+const BARUX_PATH: &str = "/KWin";
+const BARUX_IFACE: &str = "org.barux.KWin";
 
 /// The live KWin desktop source. While it is not connected, `state` is empty, so
 /// every desktop-aware item takes no room.
@@ -44,6 +49,9 @@ pub struct Kwin {
     pub state: DesktopState,
     /// `state` as last reported to the loop, for `read`'s Changed/Unchanged.
     announced: DesktopState,
+    /// Whether a KWin script snapshot has been seen: once it has, it is the live
+    /// source for the desktop list too (the D-Bus read is the pre-script fallback).
+    have_snapshot: bool,
 }
 
 impl Kwin {
@@ -54,6 +62,7 @@ impl Kwin {
             provider: None,
             state: DesktopState::default(),
             announced: DesktopState::default(),
+            have_snapshot: false,
         }
     }
 
@@ -70,16 +79,29 @@ impl Kwin {
         self.attach(bus)
     }
 
-    /// Subscribes to the virtual-desktop signals and reads the initial list.
+    /// Subscribes to the virtual-desktop signals, serves the KWin script's name and
+    /// reads the initial list.
     fn attach(&mut self, bus: Bus) -> Result<()> {
         for signal in VDM_SIGNALS {
             bus.watch(DEST, VDM_PATH, VDM_IFACE, signal)?;
         }
+        // The KWin script reports here; barux owns the name (never the desktop's).
+        bus.serve(
+            BARUX_NAME,
+            BARUX_PATH,
+            SnapshotIface {
+                notify: bus.notifier(),
+            },
+        )?;
         self.bus = Some(bus);
         self.provider = None;
         self.state = DesktopState::default();
         self.announced = DesktopState::default();
-        self.read_desktops()?;
+        self.have_snapshot = false;
+        // KWin may not be up yet, or the script not loaded: tolerate it and wait.
+        if let Err(e) = self.read_desktops() {
+            eprintln!("desktop: {e:#}; waiting for KWin");
+        }
         Ok(())
     }
 
@@ -90,23 +112,60 @@ impl Kwin {
 
     /// Reads what the bus received and folds it into `state`.
     pub fn read(&mut self) -> ReadOutcome {
-        let Some(bus) = self.bus.as_mut() else {
-            return ReadOutcome::Disconnected;
+        let notices = {
+            let Some(bus) = self.bus.as_mut() else {
+                return ReadOutcome::Disconnected;
+            };
+            bus.drain();
+            bus.take()
         };
-        bus.drain();
-        let _ = bus.take();
-        if let Err(e) = self.read_desktops() {
-            eprintln!("desktop: {e:#}");
-            return ReadOutcome::Unchanged;
+        for notice in notices {
+            if let Notice::Snapshot(json) = notice {
+                self.have_snapshot = true;
+                self.apply_snapshot(&json);
+            }
         }
-        if self.state.workspaces != self.announced.workspaces
-            || self.state.active_workspace != self.announced.active_workspace
-        {
+        if !self.have_snapshot {
+            // Until the KWin script reports, the desktop list comes from D-Bus.
+            if let Err(e) = self.read_desktops() {
+                eprintln!("desktop: {e:#}");
+            }
+        }
+        if self.state != self.announced {
             self.announced = self.state.clone();
             ReadOutcome::Changed
         } else {
             ReadOutcome::Unchanged
         }
+    }
+
+    /// Folds a KWin script snapshot into `state`; a malformed one is logged and
+    /// ignored, leaving the previous state (never a panic).
+    fn apply_snapshot(&mut self, json: &str) {
+        let snap: Snapshot = match serde_json::from_str(json) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("desktop: bad snapshot ignored: {e:#}");
+                return;
+            }
+        };
+        self.state.workspaces = snap
+            .desktops
+            .iter()
+            .map(|d| (d.position, d.name.clone()))
+            .collect();
+        self.state.active_workspace = (snap.current > 0).then_some(snap.current);
+        self.state.windows = snap
+            .windows
+            .iter()
+            .map(|w| Window {
+                addr: w.id.clone(),
+                class: w.class.clone(),
+                title: w.title.clone(),
+                workspace: w.desktop,
+            })
+            .collect();
+        self.state.focused = snap.focused;
     }
 
     /// Re-reads the virtual desktops (position -> name) and the current one from
@@ -144,6 +203,7 @@ impl Kwin {
         self.provider = None;
         self.state = DesktopState::default();
         self.announced = DesktopState::default();
+        self.have_snapshot = false;
     }
 
     /// Switches to the virtual desktop `id`. Task 7 wires the D-Bus write (and
@@ -180,6 +240,52 @@ impl Kwin {
         let user = SessionUser::from_uid(uid)?;
         Ok(crate::user::session_env(&user, None))
     }
+}
+
+/// The object barux serves the KWin script on (`org.barux.KWin` `/KWin`): the
+/// script calls `Snapshot(json)` with a JSON snapshot of the desktops and windows.
+struct SnapshotIface {
+    notify: Notifier,
+}
+
+#[zbus::interface(name = "org.barux.KWin")]
+impl SnapshotIface {
+    /// A JSON snapshot of KWin's desktops and windows (see `dist/kwin-script/`).
+    fn snapshot(&self, json: String) {
+        self.notify.push(Notice::Snapshot(json));
+    }
+}
+
+/// One KWin script snapshot. The wire shape is fixed in `docs/kwin-notes.md` and
+/// produced by `dist/kwin-script/contents/code/main.js`.
+#[derive(Deserialize)]
+struct Snapshot {
+    #[serde(default)]
+    desktops: Vec<SnapshotDesktop>,
+    #[serde(default)]
+    current: i64,
+    #[serde(default)]
+    windows: Vec<SnapshotWindow>,
+    #[serde(default)]
+    focused: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotDesktop {
+    position: i64,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct SnapshotWindow {
+    id: String,
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    desktop: i64,
 }
 
 #[cfg(test)]
@@ -346,6 +452,42 @@ mod tests {
         }
     }
 
+    /// A bare private bus with no KWin at all (the script hasn't loaded yet).
+    fn fake_bus() -> Fake {
+        let d = daemon().expect("dbus-daemon on PATH");
+        let address = d.address.clone();
+        let state = Arc::new(Mutex::new(VdmState::default()));
+        let server = Bus::connect(&env(&address)).unwrap();
+        Fake {
+            _daemon: d,
+            server,
+            state,
+            address,
+        }
+    }
+
+    /// Calls barux's served `Snapshot`, as the KWin script would.
+    fn push_snapshot(k: &Kwin, json: &str) {
+        let conn = k.bus.as_ref().unwrap().connection();
+        conn.call_method(
+            Some(BARUX_NAME),
+            BARUX_PATH,
+            Some(BARUX_IFACE),
+            "Snapshot",
+            &(json,),
+        )
+        .unwrap();
+    }
+
+    fn snapshot_one_window_on_desktop_one() -> &'static str {
+        r#"{"desktops":[{"position":1,"name":"Uno"}],"current":1,
+            "windows":[{"id":"a1","class":"kitty","title":"htop","desktop":1}],"focused":"a1"}"#
+    }
+
+    fn snapshot_desktop_one_with_no_windows() -> &'static str {
+        r#"{"desktops":[{"position":1,"name":"Uno"}],"current":1,"windows":[],"focused":null}"#
+    }
+
     /// A Kwin attached to `fake`'s bus (as `connect` would).
     fn kwin_on(fake: &Fake) -> Kwin {
         let mut k = Kwin::new(None);
@@ -388,6 +530,47 @@ mod tests {
         assert!(matches!(k.read(), ReadOutcome::Changed));
         fake.set_desktops(&[(1, "Uno")], 1);
         assert!(matches!(k.read(), ReadOutcome::Changed));
+        assert_eq!(k.state.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_becomes_windows_on_their_desktops() {
+        let fake = fake_bus();
+        let mut k = kwin_on(&fake);
+        push_snapshot(
+            &k,
+            r#"{"desktops":[{"position":1,"name":"Uno"},{"position":2,"name":"Dos"}],
+                "current":2,"windows":[{"id":"a1","class":"kitty","title":"htop","desktop":1},
+                {"id":"a2","class":"zen","title":"Mail","desktop":2}],"focused":"a2"}"#,
+        );
+        assert!(matches!(k.read(), ReadOutcome::Changed));
+        assert_eq!(k.state.window_count(1), 1);
+        assert_eq!(k.state.focused_window().map(|w| w.class.as_str()), Some("zen"));
+        assert_eq!(k.state.windows[0].workspace, 1);
+    }
+
+    #[test]
+    fn a_window_with_no_class_still_arrives() {
+        let fake = fake_bus();
+        let mut k = kwin_on(&fake);
+        push_snapshot(
+            &k,
+            r#"{"desktops":[{"position":1,"name":"Uno"}],"current":1,
+                "windows":[{"id":"a1","class":"","title":"","desktop":1}],"focused":null}"#,
+        );
+        assert!(matches!(k.read(), ReadOutcome::Changed));
+        assert_eq!(k.state.windows[0].class, "");
+    }
+
+    #[test]
+    fn a_window_that_closes_leaves_its_desktop_in_place() {
+        let fake = fake_bus();
+        let mut k = kwin_on(&fake);
+        push_snapshot(&k, snapshot_one_window_on_desktop_one());
+        assert!(matches!(k.read(), ReadOutcome::Changed));
+        push_snapshot(&k, snapshot_desktop_one_with_no_windows());
+        assert!(matches!(k.read(), ReadOutcome::Changed));
+        assert_eq!(k.state.windows.len(), 0);
         assert_eq!(k.state.workspaces.len(), 1);
     }
 }
