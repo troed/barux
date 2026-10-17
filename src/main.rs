@@ -393,9 +393,9 @@ struct App {
     /// The scene on screen changed since the last frame (the Fn layer, the sleep
     /// layer): the loop cross-fades over this long.
     cross_fade: Option<Duration>,
-    /// Hyprland's state as made up by `--expand` (previews) and tests, used
-    /// instead of the real one.
-    fake_hypr: Option<hypr::HyprState>,
+    /// The desktop state as made up by `--expand`/`--level` (previews) and tests,
+    /// used instead of the live one. (The neutral `HyprState` type is reused.)
+    fake_desktop: Option<hypr::HyprState>,
 }
 
 /// The bar at rest (`[idle]`).
@@ -996,7 +996,7 @@ impl App {
         if layer.items.iter().any(gone) {
             layer.to_mut().items.retain(|i| !gone(i));
         }
-        let hypr = match &self.fake_hypr {
+        let hypr = match &self.fake_desktop {
             Some(fake) => Some(fake),
             None => self.desktop.connected().then_some(&self.desktop.state),
         };
@@ -1672,7 +1672,7 @@ impl App {
     /// `--expand <class>`: Hyprland made up with one window of `class`,
     /// focused, on workspace 1; every workspaces item shows its buttons out.
     fn expand_preview(&mut self, class: &str) -> Result<()> {
-        self.fake_hypr = Some(hypr::HyprState {
+        self.fake_desktop = Some(hypr::HyprState {
             workspaces: [(1, "1".to_string())].into(),
             active_workspace: Some(1),
             windows: vec![hypr::Window {
@@ -1712,7 +1712,7 @@ impl App {
             title: String::new(),
             workspace,
         };
-        self.fake_hypr = Some(hypr::HyprState {
+        self.fake_desktop = Some(hypr::HyprState {
             workspaces: [1, 2, 3].map(|i| (i, i.to_string())).into(),
             active_workspace: Some(1),
             windows: vec![win("preview", first, 1), win("preview2", second, 1), win("preview3", "Code", 2)],
@@ -1735,9 +1735,10 @@ impl App {
         Ok(())
     }
 
-    /// Hyprland's state, if there is one (made up in previews and tests).
-    fn hypr_state(&self) -> Option<&hypr::HyprState> {
-        match &self.fake_hypr {
+    /// The desktop state to draw from: the made-up one in previews and tests,
+    /// else the live one while a desktop is connected.
+    fn desktop_state(&self) -> Option<&hypr::HyprState> {
+        match &self.fake_desktop {
             Some(fake) => Some(fake),
             None => self.desktop.connected().then_some(&self.desktop.state),
         }
@@ -1746,7 +1747,7 @@ impl App {
     /// Window `addr` was tapped in workspaces item `item` (and asked for the
     /// focus): its app's buttons unfold, if it has some. Returns whether they did.
     fn open_app_row(&mut self, item: &str, addr: &str, animate: bool) -> bool {
-        let Some(state) = self.hypr_state().cloned() else {
+        let Some(state) = self.desktop_state().cloned() else {
             return false;
         };
         let t = self.epoch.elapsed();
@@ -1758,7 +1759,7 @@ impl App {
     /// focus, or fold (another app or workspace, the window gone). Returns
     /// whether the bar changed.
     fn sync_app_rows(&mut self) -> bool {
-        let Some(state) = self.hypr_state().cloned() else {
+        let Some(state) = self.desktop_state().cloned() else {
             return false;
         };
         let t = self.epoch.elapsed();
@@ -2322,7 +2323,7 @@ fn new_app(p: AppParts, (w, h): (u32, u32), desktop: Kwin, home: Option<&Path>) 
             ..IdleSide::default()
         },
         cross_fade: None,
-        fake_hypr: None,
+        fake_desktop: None,
     };
     app.sync_mpv();
     app.sync_recorder();
@@ -4315,7 +4316,7 @@ mod tests {
             touchbar_light: None,
         };
         let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
-        app.fake_hypr = Some(crate::workspaces::tests::state());
+        app.fake_desktop = Some(crate::workspaces::tests::state());
         app.rebuild().unwrap();
         app
     }
@@ -4403,14 +4404,14 @@ mod tests {
         assert!(loop_tap(&mut app, at, S(2)).is_empty());
         assert!(keys_sent(&mut app).is_empty(), "nothing to kitty, which still has it");
         // Hyprland: workspace 4, Code focused.
-        let st = app.fake_hypr.as_mut().unwrap();
+        let st = app.fake_desktop.as_mut().unwrap();
         st.active_workspace = Some(4);
         st.focused = Some("c3".into());
         app.sync_app_rows();
         assert_eq!(loop_tap(&mut app, at, S(3)), vec![UiEvent::Tap("ws.code.1".into())]);
         assert_eq!(keys_sent(&mut app).len(), 4);
         // Back to workspace 2: folded.
-        let st = app.fake_hypr.as_mut().unwrap();
+        let st = app.fake_desktop.as_mut().unwrap();
         st.active_workspace = Some(2);
         st.focused = Some("a1".into());
         assert!(app.sync_app_rows());
@@ -4435,6 +4436,17 @@ mod tests {
         assert_eq!(app.scene.app_row("ws"), None, "and asleep");
         let t = app.epoch.elapsed() + S(20);
         assert_eq!(app.scene.next_change(t), None, "nothing runs");
+    }
+
+    #[test]
+    fn previews_and_tests_draw_workspaces_from_the_fake_state() {
+        let dir = tmp("desktop-state");
+        let mut app = ws_app(&dir);
+        // The made-up state (as --png --level sets) is what the items draw from.
+        assert!(app.desktop_state().is_some());
+        app.fake_desktop = None;
+        // Nothing connected and nothing made up: nothing to draw, no error.
+        assert!(app.desktop_state().is_none());
     }
 }
 
