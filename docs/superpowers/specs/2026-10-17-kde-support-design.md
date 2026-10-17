@@ -58,9 +58,10 @@ work lives on the `kde` branch.
   desktop, not an Activity. Activities are out of scope.
 - **Replacing plasmashell as the notification server.** barux mirrors; it never
   owns `org.freedesktop.Notifications`.
-- **A user-facing desktop switch.** There is no `desktop = "kde"` setting to
-  choose between Hyprland and KDE as supported modes. The Hyprland modules stay
-  in the tree for mergeability, not as a second supported configuration.
+- **A user-facing desktop switch, or a runtime guess.** There is no
+  `desktop = "kde"` setting, no probe for a running Hyprland instance and no
+  build feature choosing between the two; see §6.2. The Hyprland modules stay in
+  the tree for mergeability, not as a second supported configuration.
 - **X11 sessions.** Plasma 6 on Wayland only.
 - **Changing the DRM, touch, render, volume, brightness, battery or idle code**
   beyond what desktop integration strictly needs.
@@ -100,7 +101,9 @@ Things that would make this a failure even if it technically worked:
   installed and registered by `install.sh` and removed by `uninstall.sh`;
   the user should not have to hand-edit `kwinrc` or the KDE settings.
 
-## 6. What the human partner decided
+## 6. Decisions
+
+### 6.1 What the human partner decided
 
 These are settled; do not re-litigate them.
 
@@ -123,14 +126,33 @@ These are settled; do not re-litigate them.
 - The virtual `esc` button is **dropped from the KDE example config** (the
   physical key exists).
 
+### 6.2 Calls I made (check these while reading)
+
+- **This branch talks only to KWin/Plasma.** No runtime detection of a Hyprland
+  instance, no build feature, no fallback path. The Hyprland modules
+  (`hypr.rs`, `hyprwatch.rs`, `hyprctl.rs`) stay declared and compiling in the
+  tree so `main` merges cleanly, but they are not on a live path. This is what
+  settles the "how is the source chosen" question: it is not chosen, it is KWin.
+- **The config's `class` is KWin's `resourceClass`, lower-cased**, with
+  `resourceName` and `desktopFileName` as fallbacks for windows that carry no
+  class. This keeps the matching surface of `app_actions` (`class`,
+  `title_contains`), `app_keys` and `class_icons` the same shape as upstream. The
+  guide must say how a KDE user reads a window's class — the counterpart of
+  upstream's `hyprctl clients -j | jq -r '.[].class'` — since the values differ
+  from Hyprland's for some apps.
+- **The existing synthetic-state preview machinery is also the KDE preview
+  machinery.** `--png` with the existing level/expand/focus-class switches draws
+  the capsules, the strip and the bell with no desktop running, so the anti-goal
+  in §4 and the check in §10 are not in tension.
+
 ## 7. Shape of the work
 
 The project's own rule applies: one verifiable step at a time, each testable on
 its own, and everything that can be previewed with `--png` should be. A proposed
 order (the plan may refine it):
 
-1. **The desktop seam.** Introduce the single place where a desktop-specific
-   source is chosen, without disturbing the Hyprland modules. Keep it small: the
+1. **The desktop seam.** Introduce the single place where the desktop-specific
+   source is reached, without disturbing the Hyprland modules. Keep it small: the
    point is to keep `main` mergeable, not to design a plugin system.
 2. **Desktop/window state into `workspaces`.** Virtual desktops from KWin, the
    window list and focus from the KWin script, feeding the existing state
@@ -161,7 +183,9 @@ These are deliberate openings; a good builder settles them without asking.
 - **Where the desktop list comes from**: `org.kde.KWin.VirtualDesktopManager`
   (properties and `currentChanged`) or the script, for uniformity.
 - **The desktop seam's exact shape** (a trait, an enum, or something simpler),
-  judged by how little it disturbs `main`.
+  judged by how little it disturbs `main`. There is only one live implementation
+  to wire (§6.2); prefer the smallest thing that leaves the Hyprland modules
+  untouched.
 - **The KDE action type's schema** and what to call it.
 - **Icon lookup for notifications**: reuse the existing icon machinery and the
   `.desktop`/`StartupWMClass` lookup the window strip already uses.
