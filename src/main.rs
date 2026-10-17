@@ -1660,13 +1660,15 @@ impl App {
     }
 
     /// The focused window's class and title, for app_keys: `--focus-class` in a
-    /// preview, else Hyprland's (empty with nothing focused or no Hyprland).
+    /// preview, else the desktop's focused window (empty when nothing is focused or
+    /// no desktop is connected).
     fn app_focus(&self) -> (String, String) {
         if let Some(c) = &self.args.focus_class {
             return (c.clone(), String::new());
         }
-        let w = self.desktop.connected().then(|| self.desktop.state.focused_window()).flatten();
-        w.map_or_else(Default::default, |w| (w.class.clone(), w.title.clone()))
+        self.desktop_state()
+            .and_then(|s| s.focused_window())
+            .map_or_else(Default::default, |w| (w.class.clone(), w.title.clone()))
     }
 
     /// `--expand <class>`: Hyprland made up with one window of `class`,
@@ -4238,6 +4240,38 @@ mod tests {
         assert_eq!(app.scene.app_key_sets(), vec![("app_keys", Some("term"))]);
         app.scene.advance(app.epoch.elapsed(), &live);
         assert_eq!(app.scene.next_change(app.epoch.elapsed()), None, "no fade on a rebuild");
+    }
+
+    #[test]
+    fn app_keys_follow_the_kwin_focused_window() {
+        let dir = tmp("keys-kwin");
+        let mut app = keys_app(&dir);
+        // A KWin desktop whose focused window is a zen one (as a snapshot sets it).
+        app.fake_desktop = Some(hypr::HyprState {
+            workspaces: [(1, "Uno".into())].into(),
+            active_workspace: Some(1),
+            windows: vec![hypr::Window {
+                addr: "a1".into(),
+                class: "zen".into(),
+                title: "Mail".into(),
+                workspace: 1,
+            }],
+            focused: Some("a1".into()),
+        });
+        assert!(app.sync_app_keys());
+        assert_eq!(
+            keys_sets(&app),
+            vec![("app_keys".into(), Some("browser".into()))]
+        );
+    }
+
+    #[test]
+    fn without_a_desktop_app_keys_shows_its_default_set() {
+        let dir = tmp("keys-none");
+        let app = keys_app(&dir);
+        // No desktop: no focus, so the default set (none of the configured ones).
+        assert_eq!(app.app_focus(), (String::new(), String::new()));
+        assert_eq!(keys_sets(&app), vec![("app_keys".into(), None)]);
     }
 
     #[test]
