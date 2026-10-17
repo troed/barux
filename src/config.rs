@@ -2596,6 +2596,10 @@ pub enum Action {
     /// A Hyprland dispatch, rendered for the running config provider (Lua or
     /// hyprlang). Exactly one of the fields, see `HyprctlAction`.
     Hyprctl(HyprctlAction),
+    /// A KWin (Plasma 6) dispatch: switch virtual desktop, focus a window, launch
+    /// an application, or toggle the Overview. Exactly one of the fields, see
+    /// `KwinAction`.
+    Kwin(KwinAction),
     /// Press and release a key on the virtual keyboard, e.g. `"KEY_PLAYPAUSE"`.
     /// With `hold`, on a layer's button: down when the finger lands, up when it
     /// lifts or leaves the button (auto-repeat and combinations, like a real key).
@@ -2637,6 +2641,62 @@ pub struct HyprctlAction {
 pub enum WorkspaceRef {
     Id(i64),
     Name(String),
+}
+
+/// `action = { type = "kwin", <one of these> = ... }`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KwinAction {
+    /// Virtual desktop position (1-based), e.g. 2.
+    #[serde(default)]
+    pub desktop: Option<u32>,
+    /// Window id (the KWin script's `internalId`).
+    #[serde(default)]
+    pub focus_window: Option<String>,
+    /// Program and arguments, e.g. ["kitty", "-e", "htop"].
+    #[serde(default)]
+    pub exec: Option<Vec<String>>,
+    /// Toggle KWin's Overview effect.
+    #[serde(default)]
+    pub overview: Option<bool>,
+}
+
+/// What a `kwin` action means (exactly one field set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KwinDispatch {
+    Desktop(u32),
+    FocusWindow(String),
+    Exec(Vec<String>),
+    Overview,
+}
+
+impl KwinAction {
+    pub fn to_action(&self) -> Result<KwinDispatch> {
+        let set = [
+            self.desktop.is_some(),
+            self.focus_window.is_some(),
+            self.exec.is_some(),
+            self.overview == Some(true),
+        ];
+        if set.iter().filter(|&&x| x).count() != 1 {
+            bail!("kwin action needs exactly one of desktop, focus_window, exec, overview");
+        }
+        Ok(if let Some(d) = self.desktop {
+            if d == 0 {
+                bail!("kwin action: desktop must be 1 or more");
+            }
+            KwinDispatch::Desktop(d)
+        } else if let Some(w) = &self.focus_window {
+            KwinDispatch::FocusWindow(crate::kwin::window_arg(w)?)
+        } else if let Some(argv) = &self.exec {
+            if argv.first().is_none_or(|p| p.is_empty()) {
+                bail!("kwin action: exec needs a non-empty argv");
+            }
+            KwinDispatch::Exec(argv.clone())
+        } else {
+            KwinDispatch::Overview
+        })
+    }
 }
 
 impl HyprctlAction {
@@ -2911,6 +2971,9 @@ fn validate_action(what: &str, action: &Action) -> Result<()> {
                 eprintln!("config: {what}: `args` is deprecated, read as {a:?}");
             }
         }
+        Action::Kwin(k) => {
+            k.to_action().with_context(|| what.to_string())?;
+        }
         Action::Key { key, .. } => {
             let code = KeyCode::from_str(key)
                 .map_err(|_| anyhow::anyhow!("{what}: unknown key {key:?}"))?;
@@ -2965,10 +3028,14 @@ mod tests {
             [[buttons]]
             id = "qs"
             action = { type = "socket" }
+
+            [[buttons]]
+            id = "kde"
+            action = { type = "kwin", desktop = 2 }
             "#,
         )
         .unwrap();
-        assert_eq!(c.buttons.len(), 6);
+        assert_eq!(c.buttons.len(), 7);
         let hypr = |id: &str| match &c.button(id).unwrap().action {
             Action::Hyprctl(h) => h.to_action().unwrap(),
             _ => panic!(),
@@ -2976,6 +3043,11 @@ mod tests {
         assert_eq!(hypr("term"), HyprAction::Exec(vec!["kitty".into()]));
         assert_eq!(hypr("ws"), HyprAction::Workspace("2".into()));
         assert_eq!(hypr("old"), HyprAction::Workspace("1".into()));
+        let kwin = |id: &str| match &c.button(id).unwrap().action {
+            Action::Kwin(k) => k.to_action().unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(kwin("kde"), KwinDispatch::Desktop(2));
         assert_eq!(
             c.button("notify").unwrap().action.timeout(),
             Some(Duration::from_millis(3000))
@@ -2995,6 +3067,29 @@ mod tests {
         assert!(parse("[[buttons]]\nid='a'\naction={type='hyprctl',focus_window='zz'}").is_err());
         assert!(parse("[[buttons]]\nid='a'\naction={type='hyprctl',exec=[]}").is_err());
         assert!(parse("[[buttons]]\nid='a'\naction={type='hyprctl',dispatch='x'}").is_err());
+    }
+
+    /// Parses a `kwin` action with `fields` inside the inline table.
+    fn kwin_action(fields: &str) -> Result<Config> {
+        let body = fields.replace('\n', ",");
+        let sep = if body.trim().is_empty() { "" } else { "," };
+        parse(&format!(
+            "[[buttons]]\nid = \"a\"\naction = {{ type = \"kwin\"{sep}{body} }}"
+        ))
+    }
+
+    #[test]
+    fn a_kwin_action_needs_exactly_one_field() {
+        assert!(kwin_action("desktop = 2").is_ok());
+        assert!(kwin_action("").is_err());
+        assert!(kwin_action("desktop = 2\nexec = [\"kitty\"]").is_err());
+        // Each field on its own, and the obvious bad values.
+        assert!(kwin_action("focus_window = \"a1\"").is_ok());
+        assert!(kwin_action("exec = [\"kitty\"]").is_ok());
+        assert!(kwin_action("overview = true").is_ok());
+        assert!(kwin_action("desktop = 0").is_err());
+        assert!(kwin_action("overview = false").is_err());
+        assert!(kwin_action("focus_window = \"two words\"").is_err());
     }
 
     const MY_BAR: &str = r##"

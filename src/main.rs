@@ -50,7 +50,7 @@ use anyhow::{Result, anyhow};
 use battery::{Battery, BatteryStatus, Uevents};
 use canvas::{Canvas, Font, Rect, Rgba, Svg};
 use capture::CaptureMode;
-use config::{Action, Config, IdleConfig, ItemConfig, ItemKind, Loading, StatusIdle, WakeOn};
+use config::{Action, Config, IdleConfig, ItemConfig, ItemKind, KwinDispatch, Loading, StatusIdle, WakeOn};
 use desktopidle::{DesktopEvent, DesktopIdle};
 use gifpick::{Fresh, GifCache, Loader, PickerShow, Reply, Request};
 use display::DrmBackend;
@@ -587,7 +587,7 @@ impl App {
 
     /// Runs a capture child's script, as the session user in the Wayland session.
     fn run_capture(&mut self, id: &str, script: String, mode: CaptureMode) {
-        if !self.runner.has_hypr() {
+        if !self.runner.has_desktop() {
             eprintln!("capture: Hyprland not connected (no Wayland session), ignoring {id}");
             return;
         }
@@ -1452,7 +1452,7 @@ impl App {
     /// Runs `hyprctl dispatch <expr>` with the syntax of the connected Hyprland's
     /// config provider. The result is checked in `on_hyprctl_finished`.
     fn hyprctl(&mut self, action: &HyprAction) {
-        let Some(provider) = self.desktop.provider.filter(|_| self.runner.has_hypr()) else {
+        let Some(provider) = self.desktop.provider.filter(|_| self.runner.has_desktop()) else {
             eprintln!("action: Hyprland not connected, ignoring {action:?}");
             return;
         };
@@ -1566,6 +1566,31 @@ impl App {
             }
             Action::Hyprctl(h) => match h.to_action() {
                 Ok(a) => self.hyprctl(&a),
+                Err(e) => eprintln!("action: {e:#}"),
+            },
+            Action::Kwin(k) => match k.to_action() {
+                Ok(KwinDispatch::Desktop(position)) => {
+                    if let Err(e) = self.desktop.dispatch_workspace(&position.to_string()) {
+                        eprintln!("action: {e:#}");
+                    }
+                }
+                Ok(KwinDispatch::FocusWindow(id)) => {
+                    if let Err(e) = self.desktop.dispatch_focus_window(&id) {
+                        eprintln!("action: {e:#}");
+                    }
+                }
+                Ok(KwinDispatch::Exec(argv)) => {
+                    let timeout = runner::DEFAULT_TIMEOUT;
+                    if let Err(e) = self.runner.spawn(&argv, Some(timeout), Purpose::Action, false)
+                    {
+                        eprintln!("action: {e:#}");
+                    }
+                }
+                Ok(KwinDispatch::Overview) => {
+                    if let Err(e) = self.desktop.overview() {
+                        eprintln!("action: {e:#}");
+                    }
+                }
                 Err(e) => eprintln!("action: {e:#}"),
             },
             Action::Key { key, .. } => match (&mut self.keyboard, KeyCode::from_str(key)) {
@@ -2274,7 +2299,7 @@ struct AppParts {
 
 fn new_app(p: AppParts, (w, h): (u32, u32), desktop: Kwin, home: Option<&Path>) -> Result<App> {
     let mut runner = Runner::new(p.session);
-    runner.set_hypr(desktop.session_env());
+    runner.set_desktop(desktop.session_env());
     let epoch = Instant::now();
     let mut app = App {
         args: p.args,
@@ -2453,7 +2478,7 @@ fn watch_desktop(epoll: &Epoll, app: &mut App, retry: &TimerFd) -> Result<()> {
             }
         }
     }
-    app.runner.set_hypr(app.desktop.session_env());
+    app.runner.set_desktop(app.desktop.session_env());
     // The desktop came or went: the desktop's idle comes from it.
     app.sync_desktop_idle(false);
     if let Some(fd) = app.desktop.event_fd() {
@@ -3736,7 +3761,7 @@ mod tests {
         app.desktop = Kwin::new(Some(uid));
         app.desktop.connect().unwrap();
         app.runner.set_user(Some(user::SessionUser::from_uid(uid).unwrap()));
-        app.runner.set_hypr(app.desktop.session_env());
+        app.runner.set_desktop(app.desktop.session_env());
         app.idle.follow_desktop = true;
         let t0 = Instant::now();
         app.sync_idle(t0);

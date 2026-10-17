@@ -448,19 +448,16 @@ impl Hypr {
         }
     }
 
-    /// What commands need to talk to this Hyprland: its instance signature, and the
-    /// Wayland socket name from `hyprland.lock` (line 1: pid, line 2: display).
-    pub fn session_env(&self) -> Option<crate::user::HyprEnv> {
+    /// What commands need to talk to this Hyprland: the Wayland socket name from
+    /// `hyprland.lock` (line 1: pid, line 2: display). The signature field is gone
+    /// from the neutral `DesktopEnv`; Hyprland is off the live path on this branch.
+    pub fn session_env(&self) -> Option<crate::user::DesktopEnv> {
         let dir = &self.instance.as_ref()?.dir;
-        let signature = dir.file_name()?.to_str()?.to_string();
         let wayland_display = fs::read_to_string(dir.join("hyprland.lock"))
             .ok()
             .and_then(|l| l.lines().nth(1).map(|s| s.trim().to_string()))
             .filter(|s| !s.is_empty());
-        Some(crate::user::HyprEnv {
-            signature,
-            wayland_display,
-        })
+        Some(crate::user::DesktopEnv { wayland_display })
     }
 
     /// Whether the event socket is connected (the state is live).

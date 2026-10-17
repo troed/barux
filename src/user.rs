@@ -86,11 +86,10 @@ pub fn resolve(run_as: Option<&str>, config_path: Option<&Path>) -> Option<Sessi
     }
 }
 
-/// Session details only Hyprland knows, passed to commands.
+/// The desktop session's details, passed to the commands barux launches.
 #[derive(Clone, Default)]
-pub struct HyprEnv {
-    pub signature: String,
-    /// From `hyprland.lock`: only a hint, checked like any other socket.
+pub struct DesktopEnv {
+    /// The compositor's Wayland socket name (a hint, checked like any other).
     pub wayland_display: Option<String>,
 }
 
@@ -100,22 +99,21 @@ pub struct HyprEnv {
 /// - `XDG_RUNTIME_DIR`: `/run/user/<uid>`, only if it is a real directory owned by
 ///   the user and private to them (like logind makes it). Without it, none of what
 ///   follows (all of it lives there).
-/// - `WAYLAND_DISPLAY`: Hyprland's (from `hyprland.lock`), else the first
+/// - `WAYLAND_DISPLAY`: the compositor's (from `DesktopEnv`), else the first
 ///   `wayland-*` there, and only if it is a socket owned by the user.
-/// - `HYPRLAND_INSTANCE_SIGNATURE`: the instance the daemon is connected to, only
-///   if it is the user's (`<runtime dir>/hypr/<signature>`, owned by them).
+/// - With a desktop session: `XDG_SESSION_TYPE=wayland` and `XDG_CURRENT_DESKTOP=KDE`.
 /// - D-Bus: the user's bus socket, if there is one.
 ///
 /// What is not found is left out: the command runs anyway, and a GUI app fails
 /// as it would in a TTY.
-pub fn session_env(user: &SessionUser, hypr: Option<&HyprEnv>) -> Vec<(String, String)> {
-    session_env_in(user, hypr, &user.runtime_dir())
+pub fn session_env(user: &SessionUser, desktop: Option<&DesktopEnv>) -> Vec<(String, String)> {
+    session_env_in(user, desktop, &user.runtime_dir())
 }
 
 /// `session_env` with the runtime directory given (a fake one in tests).
 fn session_env_in(
     user: &SessionUser,
-    hypr: Option<&HyprEnv>,
+    desktop: Option<&DesktopEnv>,
     runtime: &Path,
 ) -> Vec<(String, String)> {
     let home = user.home.display().to_string();
@@ -146,17 +144,14 @@ fn session_env_in(
             format!("unix:path={}", bus.display()),
         ));
     }
-    let hint = hypr.and_then(|h| h.wayland_display.as_deref());
+    let hint = desktop.and_then(|d| d.wayland_display.as_deref());
     if let Some(w) = wayland_display(runtime, user.uid, hint) {
         env.push(("WAYLAND_DISPLAY".into(), w));
-    }
-    let signature = hypr.map(|h| h.signature.as_str()).filter(|s| {
-        plain_name(s) && owned_dir(&runtime.join("hypr").join(s), user.uid)
-    });
-    if let Some(sig) = signature {
-        env.push(("HYPRLAND_INSTANCE_SIGNATURE".into(), sig.to_string()));
-        env.push(("XDG_SESSION_TYPE".into(), "wayland".into()));
-        env.push(("XDG_CURRENT_DESKTOP".into(), "Hyprland".into()));
+        // A desktop session: the session is Wayland, on Plasma (KWin).
+        if desktop.is_some() {
+            env.push(("XDG_SESSION_TYPE".into(), "wayland".into()));
+            env.push(("XDG_CURRENT_DESKTOP".into(), "KDE".into()));
+        }
     }
     env
 }
@@ -228,9 +223,8 @@ mod tests {
         env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
-    fn hypr(sig: &str, lock: Option<&str>) -> HyprEnv {
-        HyprEnv {
-            signature: sig.into(),
+    fn desktop(lock: Option<&str>) -> DesktopEnv {
+        DesktopEnv {
             wayland_display: lock.map(str::to_string),
         }
     }
@@ -242,13 +236,12 @@ mod tests {
         let _w1 = UnixListener::bind(rt.join("wayland-1")).unwrap();
         fs::write(rt.join("wayland-1.lock"), "").unwrap();
         let _bus = UnixListener::bind(rt.join("bus")).unwrap();
-        fs::create_dir_all(rt.join("hypr/abc_123_456")).unwrap();
-        let env = session_env_in(&me(), Some(&hypr("abc_123_456", Some("wayland-1"))), &rt);
+        let env = session_env_in(&me(), Some(&desktop(Some("wayland-1"))), &rt);
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), rt.to_str());
-        // Hyprland's own display wins over the first one by name.
+        // The desktop's own display wins over the first one by name.
         assert_eq!(get(&env, "WAYLAND_DISPLAY"), Some("wayland-1"));
-        assert_eq!(get(&env, "HYPRLAND_INSTANCE_SIGNATURE"), Some("abc_123_456"));
-        assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), Some("Hyprland"));
+        assert_eq!(get(&env, "XDG_SESSION_TYPE"), Some("wayland"));
+        assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), Some("KDE"));
         let bus = format!("unix:path={}/bus", rt.display());
         assert_eq!(get(&env, "DBUS_SESSION_BUS_ADDRESS"), Some(bus.as_str()));
         assert_eq!(get(&env, "HOME"), Some("/home/ana"));
@@ -259,17 +252,28 @@ mod tests {
             assert!(
                 [
                     "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "XDG_RUNTIME_DIR",
-                    "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+                    "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY",
                     "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
                 ]
                 .contains(k),
                 "{k} leaked"
             );
         }
-        // Without a hint (no lock, or no Hyprland): the first socket by name.
+        // Without a desktop: the first socket by name, and no desktop variables.
         let env = session_env_in(&me(), None, &rt);
         assert_eq!(get(&env, "WAYLAND_DISPLAY"), Some("wayland-0"));
-        assert_eq!(get(&env, "HYPRLAND_INSTANCE_SIGNATURE"), None);
+        assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), None);
+        let _ = fs::remove_dir_all(&rt);
+    }
+
+    #[test]
+    fn a_plasma_session_gets_kde_variables() {
+        let rt = runtime("plasma");
+        let _w = UnixListener::bind(rt.join("wayland-0")).unwrap();
+        let env = session_env_in(&me(), Some(&desktop(Some("wayland-0"))), &rt);
+        assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), Some("KDE"));
+        assert_eq!(get(&env, "XDG_SESSION_TYPE"), Some("wayland"));
+        assert_eq!(get(&env, "WAYLAND_DISPLAY"), Some("wayland-0"));
         let _ = fs::remove_dir_all(&rt);
     }
 
@@ -280,14 +284,12 @@ mod tests {
         fs::write(rt.join("wayland-0"), "").unwrap();
         let _real = UnixListener::bind(rt.join("real")).unwrap();
         symlink(rt.join("real"), rt.join("wayland-1")).unwrap();
-        // A hint that would leave the directory, an instance that isn't there or
-        // escapes it.
-        fs::create_dir_all(rt.join("elsewhere")).unwrap();
-        for (sig, lock) in [("nope", "../real"), ("../elsewhere", "wayland-0"), ("", "/x")] {
-            let env = session_env_in(&me(), Some(&hypr(sig, Some(lock))), &rt);
+        // A hint that would leave the directory, a name that isn't a socket, or an
+        // absolute path: none is taken.
+        for lock in ["../real", "wayland-0", "/x"] {
+            let env = session_env_in(&me(), Some(&desktop(Some(lock))), &rt);
             assert_eq!(get(&env, "XDG_RUNTIME_DIR"), rt.to_str());
-            assert_eq!(get(&env, "WAYLAND_DISPLAY"), None, "{sig:?} {lock:?}");
-            assert_eq!(get(&env, "HYPRLAND_INSTANCE_SIGNATURE"), None, "{sig:?}");
+            assert_eq!(get(&env, "WAYLAND_DISPLAY"), None, "{lock:?}");
             assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), None);
             assert_eq!(get(&env, "DBUS_SESSION_BUS_ADDRESS"), None);
         }
@@ -295,22 +297,20 @@ mod tests {
         let mut other = me();
         other.uid += 1;
         let _w = UnixListener::bind(rt.join("wayland-2")).unwrap();
-        fs::create_dir_all(rt.join("hypr/sig")).unwrap();
-        let env = session_env_in(&other, Some(&hypr("sig", Some("wayland-2"))), &rt);
+        let env = session_env_in(&other, Some(&desktop(Some("wayland-2"))), &rt);
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), None);
         assert_eq!(get(&env, "WAYLAND_DISPLAY"), None);
-        assert_eq!(get(&env, "HYPRLAND_INSTANCE_SIGNATURE"), None);
         assert_eq!(get(&env, "HOME"), Some("/home/ana"), "the basics are always there");
         fs::set_permissions(&rt, fs::Permissions::from_mode(0o755)).unwrap();
-        let env = session_env_in(&me(), Some(&hypr("sig", Some("wayland-2"))), &rt);
+        let env = session_env_in(&me(), Some(&desktop(Some("wayland-2"))), &rt);
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), None, "group/others can enter it");
         let env = session_env_in(&me(), None, &rt.join("missing"));
         assert_eq!(get(&env, "XDG_RUNTIME_DIR"), None);
-        // Back to private: the good socket and instance are taken.
+        // Back to private: the good socket is taken.
         fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
-        let env = session_env_in(&me(), Some(&hypr("sig", Some("wayland-2"))), &rt);
+        let env = session_env_in(&me(), Some(&desktop(Some("wayland-2"))), &rt);
         assert_eq!(get(&env, "WAYLAND_DISPLAY"), Some("wayland-2"));
-        assert_eq!(get(&env, "HYPRLAND_INSTANCE_SIGNATURE"), Some("sig"));
+        assert_eq!(get(&env, "XDG_CURRENT_DESKTOP"), Some("KDE"));
         let _ = fs::remove_dir_all(&rt);
     }
 }

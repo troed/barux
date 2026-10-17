@@ -10,7 +10,7 @@
 use crate::dbus::{Bus, Notice, Notifier};
 use crate::hypr::{HyprState as DesktopState, ReadOutcome, Window};
 use crate::hyprctl::ConfigProvider;
-use crate::user::{HyprEnv, SessionUser};
+use crate::user::{DesktopEnv, SessionUser};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -324,19 +324,15 @@ impl Kwin {
         SessionUser::from_uid(uid).ok().map(|u| u.runtime_dir())
     }
 
-    /// What commands need to talk to this desktop: the Wayland socket. KWin has no
-    /// instance signature, so that stays empty (Task 9 drops the field).
-    pub fn session_env(&self) -> Option<HyprEnv> {
+    /// What commands need to talk to this desktop: the Wayland socket.
+    pub fn session_env(&self) -> Option<DesktopEnv> {
         self.bus.as_ref()?;
         let env = self.session_env_vec().ok()?;
         let wayland_display = env
             .iter()
             .find(|(k, _)| k == "WAYLAND_DISPLAY")
             .map(|(_, v)| v.clone());
-        Some(HyprEnv {
-            signature: String::new(),
-            wayland_display,
-        })
+        Some(DesktopEnv { wayland_display })
     }
 
     /// The session user's environment (the bus address among it).

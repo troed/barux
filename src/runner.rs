@@ -11,7 +11,7 @@
 //!   daemon exits. Under systemd they still share the service's cgroup, so stopping
 //!   or restarting the service ends them too.
 
-use crate::user::{HyprEnv, SessionUser, session_env};
+use crate::user::{DesktopEnv, SessionUser, session_env};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     sys::signal::{Signal, killpg},
@@ -70,7 +70,7 @@ struct Running {
 
 pub struct Runner {
     user: Option<SessionUser>,
-    hypr: Option<HyprEnv>,
+    desktop: Option<DesktopEnv>,
     /// Daemon runs as root and must drop to `user` in the child.
     drop_privileges: bool,
     children: Vec<Running>,
@@ -85,7 +85,7 @@ impl Runner {
         }
         Runner {
             user,
-            hypr: None,
+            desktop: None,
             drop_privileges,
             children: Vec::new(),
         }
@@ -102,8 +102,8 @@ impl Runner {
         }
     }
 
-    pub fn set_hypr(&mut self, hypr: Option<HyprEnv>) {
-        self.hypr = hypr;
+    pub fn set_desktop(&mut self, desktop: Option<DesktopEnv>) {
+        self.desktop = desktop;
     }
 
     /// Who commands (and the gif_picker's file reads) run as.
@@ -116,8 +116,8 @@ impl Runner {
         self.user.as_ref().map(SessionUser::runtime_dir)
     }
 
-    pub fn has_hypr(&self) -> bool {
-        self.hypr.is_some()
+    pub fn has_desktop(&self) -> bool {
+        self.desktop.is_some()
     }
 
     pub fn is_running(&self, purpose: Purpose) -> bool {
@@ -184,7 +184,7 @@ impl Runner {
         let mut cmd = Command::new(prog);
         cmd.args(args)
             .env_clear()
-            .envs(session_env(user, self.hypr.as_ref()))
+            .envs(session_env(user, self.desktop.as_ref()))
             .current_dir(&user.home)
             .stdin(Stdio::null())
             .stdout(if capture {
@@ -360,8 +360,7 @@ mod tests {
         // SAFETY: tests that read the environment don't depend on this variable.
         unsafe { std::env::set_var("BARUX_LEAK", "1") };
         let mut r = runner();
-        r.set_hypr(Some(HyprEnv {
-            signature: "../not-mine".into(),
+        r.set_desktop(Some(DesktopEnv {
             wayland_display: Some("/tmp/x".into()),
         }));
         r.spawn(&argv(&["/usr/bin/env"]), Some(Duration::from_secs(2)), Purpose::Action, true)
@@ -371,9 +370,9 @@ mod tests {
         let keys: Vec<_> = f.stdout.lines().filter_map(|l| l.split('=').next()).collect();
         assert!(keys.contains(&"HOME") && keys.contains(&"PATH"), "{keys:?}");
         assert!(!keys.contains(&"BARUX_LEAK"), "inherited: {keys:?}");
-        // A signature or display that isn't a plain name in the user's runtime dir
-        // is never passed on.
-        assert!(!keys.contains(&"HYPRLAND_INSTANCE_SIGNATURE"), "{keys:?}");
+        // A display that isn't a plain name in the user's runtime dir is never
+        // passed on, and no desktop variables appear without one.
+        assert!(!keys.contains(&"XDG_CURRENT_DESKTOP"), "{keys:?}");
         assert!(!f.stdout.contains("WAYLAND_DISPLAY=/tmp/x"), "{}", f.stdout);
     }
 
