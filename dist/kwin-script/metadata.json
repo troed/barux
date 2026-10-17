@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "org.barux.desktop",
+        "Name": "barux desktop bridge",
+        "Description": "Reports KWin's virtual desktops and window list to barux over the session bus.",
+        "Version": "1.0",
+        "License": "MIT",
+        "EnabledByDefault": false
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}
