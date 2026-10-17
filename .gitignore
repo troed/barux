@@ -4,3 +4,6 @@ config.backup-*.toml
 config.mine.toml
 config.backup-*.toml
 *.orig
+
+# Brainstorming visual companion mockups
+.superpowers/
