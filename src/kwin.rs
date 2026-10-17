@@ -36,6 +36,16 @@ const BARUX_NAME: &str = "org.barux.KWin";
 const BARUX_PATH: &str = "/KWin";
 const BARUX_IFACE: &str = "org.barux.KWin";
 
+/// A KWin window id as the bar sends it: the KWin script's `internalId`, a
+/// UUID-like string (`docs/kwin-notes.md` §2, UNSURE). Any non-empty, printable,
+/// whitespace-free id up to 64 bytes is accepted; the rest is rejected.
+pub fn window_arg(id: &str) -> Result<String> {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+        bail!("bad window id {id:?}");
+    }
+    Ok(id.to_string())
+}
+
 /// The live KWin desktop source. While it is not connected, `state` is empty, so
 /// every desktop-aware item takes no room.
 pub struct Kwin {
@@ -572,5 +582,36 @@ mod tests {
         assert!(matches!(k.read(), ReadOutcome::Changed));
         assert_eq!(k.state.windows.len(), 0);
         assert_eq!(k.state.workspaces.len(), 1);
+    }
+
+    fn snapshot_two_desktops_two_kitty() -> &'static str {
+        r#"{"desktops":[{"position":1,"name":"Uno"},{"position":2,"name":"Dos"}],"current":1,
+            "windows":[{"id":"a1","class":"kitty","title":"one","desktop":1},
+            {"id":"a2","class":"kitty","title":"two","desktop":2}],"focused":"a1"}"#
+    }
+
+    #[test]
+    fn two_windows_of_a_class_land_on_their_own_desktops() {
+        let fake = fake_bus();
+        let mut k = kwin_on(&fake);
+        push_snapshot(&k, snapshot_two_desktops_two_kitty());
+        assert!(matches!(k.read(), ReadOutcome::Changed));
+        let view = crate::workspaces::WsView::from_state(&k.state, crate::config::WsShow::Existing);
+        assert_eq!(
+            view.workspaces
+                .iter()
+                .map(|w| w.windows.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn a_window_id_is_the_scripts_internal_id() {
+        assert_eq!(window_arg("a1").unwrap(), "a1");
+        assert!(window_arg("60c2a5b0-8f3e-4a1c-9d2e-0f1a2b3c4d5e").is_ok());
+        for bad in ["", "two words", "line\nbreak", &"x".repeat(65)] {
+            assert!(window_arg(bad).is_err(), "accepted {bad:?}");
+        }
     }
 }

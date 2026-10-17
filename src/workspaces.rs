@@ -2029,6 +2029,18 @@ pub mod tests {
         assert_ne!(class_colour("kitty"), class_colour("firefox"));
     }
 
+    #[test]
+    fn an_empty_class_gets_a_letter_circle_not_a_blank_cell() {
+        // KWin may report a window with no resourceClass; the strip must still draw
+        // it (its letter circle), never a blank cell.
+        let mut icons = crate::icons::IconResolver::new(None, 20);
+        let style = style(crate::config::WsStrip::Active);
+        match WinGlyph::resolve("", &style, &mut icons) {
+            WinGlyph::Letter(c, _) => assert_eq!(c, '?'),
+            _ => panic!("an empty class must draw its letter circle, not a blank cell"),
+        }
+    }
+
     /// Not a check: borders and tint at rest, a strip opening and a birth, cut to
     /// the item and enlarged 4x, as PNGs in $BARUX_FRAMES (run with --ignored).
     #[test]
