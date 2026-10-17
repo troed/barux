@@ -14,6 +14,11 @@ cd "$(dirname "$0")"
 # LEGACY_* paths.
 source tools/legacy.sh
 
+# The KWin desktop bridge script (per-user: no sudo).
+KWIN_ID=org.barux.desktop
+KWIN_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/kwin/scripts/$KWIN_ID
+KWINRC=${XDG_CONFIG_HOME:-$HOME/.config}/kwinrc
+
 legacy_only=false
 purge=false
 for arg in "$@"; do
@@ -75,6 +80,9 @@ if ((${#files[@]})); then printf '  %s\n' "${files[@]}"; else echo "  (no instal
 for d in "${dirs[@]}"; do
     if $purge; then echo "  $d (--purge)"; else echo "Kept: $d (use --purge to remove it)"; fi
 done
+if ! $legacy_only && [[ -e $KWIN_DIR ]]; then
+    echo "  $KWIN_DIR (the KWin script; and its kwinrc entry)"
+fi
 echo
 read -r -p "Proceed? [y/N] " answer
 [[ $answer == [yY]* ]] || { echo "Nothing removed."; exit 0; }
@@ -82,6 +90,13 @@ read -r -p "Proceed? [y/N] " answer
 set -x
 ((${#files[@]})) && sudo rm -f -- "${files[@]}"
 if $purge && ((${#dirs[@]})); then sudo rm -rf -- "${dirs[@]}"; fi
+if ! $legacy_only && [[ -e $KWIN_DIR ]]; then
+    rm -rf -- "$KWIN_DIR"
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" --delete
+    fi
+    if command -v qdbus6 >/dev/null 2>&1; then qdbus6 org.kde.KWin /KWin reconfigure || true; fi
+fi
 set +x
 
 cat <<'EOF'

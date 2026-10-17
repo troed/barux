@@ -29,6 +29,11 @@ UNIT_DIR=/etc/systemd/system
 # Read after tiny-dfr's 99-touchbar-*.rules (see the file).
 UDEV_RULE=/etc/udev/rules.d/99-zz-barux.rules
 MODULES=/etc/modules-load.d/barux.conf
+# The KWin desktop bridge script is per-user (not sudo): installed under the
+# invoking user's data dir, enabled in their kwinrc.
+KWIN_ID=org.barux.desktop
+KWIN_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/kwin/scripts/$KWIN_ID
+KWINRC=${XDG_CONFIG_HOME:-$HOME/.config}/kwinrc
 CONF_DIR=/etc/barux
 CONF=$CONF_DIR/config.toml
 ICONS=$CONF_DIR/icons
@@ -185,6 +190,7 @@ if ((missing)); then
 fi
 if $check_only; then
     echo
+    echo "KWin script: $KWIN_DIR <- dist/kwin-script; enabled via kwinrc [Plugins] ${KWIN_ID}Enabled=true, then org.kde.KWin reconfigure."
     echo "All requirements met."
     exit 0
 fi
@@ -273,6 +279,8 @@ row "$UNIT_DIR/barux.service" "<- dist/barux.service"
 row "$UNIT_DIR/barux-resume.service" "<- dist/barux-resume.service"
 row "$UDEV_RULE" "<- dist/99-zz-barux.rules"
 row "$MODULES" "<- dist/modules-load.conf (loads uinput at boot)"
+row "$KWIN_DIR" "<- dist/kwin-script (KWin: desktops, the window strip, focus)"
+row "kwinrc [Plugins] ${KWIN_ID}Enabled=true" "then org.kde.KWin reconfigure (per-user)"
 if [[ -n $NEW_CONF ]]; then
     run_as=$(grep -Em1 '^[[:space:]]*run_as' "$NEW_CONF" | sed -E 's/.*=[[:space:]]*"?([^"]*)"?.*/\1/')
     row "$CONF" "<- $CONF_FROM"
@@ -324,6 +332,16 @@ sudo install -Dm644 dist/barux.service "$UNIT_DIR/barux.service"
 sudo install -Dm644 dist/barux-resume.service "$UNIT_DIR/barux-resume.service"
 sudo install -Dm644 dist/99-zz-barux.rules "$UDEV_RULE"
 sudo install -Dm644 dist/modules-load.conf "$MODULES"
+# The KWin script: per-user, no sudo, and enabled in the user's kwinrc.
+mkdir -p "$KWIN_DIR"
+cp -R dist/kwin-script/. "$KWIN_DIR/"
+if have kwriteconfig6; then
+    kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_ID}Enabled" true
+else
+    grep -q "${KWIN_ID}Enabled" "$KWINRC" 2>/dev/null ||
+        printf '\n[Plugins]\n%sEnabled=true\n' "$KWIN_ID" >>"$KWINRC"
+fi
+if have qdbus6; then qdbus6 org.kde.KWin /KWin reconfigure || true; fi
 if [[ -n $NEW_CONF ]]; then
     sudo install -d -m755 -o root -g root "$CONF_DIR"
     sudo install -m644 -o root -g root "$NEW_CONF" "$CONF"
