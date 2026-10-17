@@ -20,6 +20,10 @@ toml = "0.9"
 # [idle] activity_from "desktop": ext-idle-notify-v1 from the compositor (pure Rust).
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["staging", "client"] }
+# D-Bus for the KDE desktop source (Task 2 onward): the session-bus connection,
+# the virtual-desktop signals and the name the KWin script calls. Pinned to 5:
+# 6 dropped the blocking API this project relies on (there is no async runtime).
+zbus = "5"
 
 # Optimise dependencies (image scaling, tiny-skia, resvg) even in debug builds;
 # our own code stays unoptimised for fast rebuilds.

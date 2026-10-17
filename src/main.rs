@@ -7,6 +7,7 @@ mod border;
 mod canvas;
 mod capture;
 mod config;
+mod dbus;
 mod display;
 mod expandable;
 mod expander;
@@ -18,6 +19,7 @@ mod gifpick;
 mod hypr;
 mod hyprctl;
 mod hyprwatch;
+mod kwin;
 mod icons;
 mod desktopidle;
 mod idle;
@@ -55,11 +57,11 @@ use display::DrmBackend;
 use evdev::KeyCode;
 use fnkey::{FnEvent, FnKeyboard, Lost, NodeWatch};
 use fnlayer::{Fade, FnMachine};
-use hypr::{Hypr, ReadOutcome};
+use hypr::ReadOutcome;
+use kwin::Kwin;
 use barlight::BarLight;
 use idle::{IdleMachine, Stage};
 use hyprctl::HyprAction;
-use hyprwatch::InstanceWatch;
 use icons::IconResolver;
 use ipc::{IdleSignal, Incoming, IpcServer};
 use keys::VirtualKeyboard;
@@ -99,12 +101,9 @@ const PICK_FADE: Duration = Duration::from_millis(150);
 /// The longest the bar takes to wake from an idle stage.
 const WAKE_FADE: Duration = Duration::from_millis(150);
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
-/// Fallback only, if the instance watch can't be set up: how often to look for
-/// Hyprland again while it isn't there.
-const HYPR_RETRY: Duration = Duration::from_secs(3);
-/// After a filesystem event that didn't lead to a connection, try once more this
-/// much later: the socket may exist a moment before Hyprland answers on it.
-const HYPR_SETTLE: Duration = Duration::from_secs(1);
+/// How often to look for the session bus again while it (or the session user)
+/// isn't there yet.
+const DESKTOP_RETRY: Duration = Duration::from_secs(3);
 const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Our socket. Under /run so it exists before any login session (systemd, milestone
@@ -155,13 +154,11 @@ const USAGE: &str = "usage: barux [pattern|demo|anim|touch|windows|buttons|bar] 
 const TOKEN_SIGNAL: u64 = 0;
 const TOKEN_TIMER: u64 = 1;
 const TOKEN_TOUCH: u64 = 2;
-const TOKEN_HYPR: u64 = 3;
-const TOKEN_HYPR_RETRY: u64 = 4;
+const TOKEN_DESKTOP: u64 = 3;
+const TOKEN_DESKTOP_RETRY: u64 = 4;
 const TOKEN_IPC_LISTEN: u64 = 5;
 const TOKEN_VOLUME_MONITOR: u64 = 6;
 const TOKEN_BACKLIGHT: u64 = 7;
-const TOKEN_HYPR_WATCH: u64 = 8;
-const TOKEN_HYPR_MOUNTS: u64 = 9;
 const TOKEN_CLOCK: u64 = 10;
 const TOKEN_UEVENT: u64 = 11;
 const TOKEN_GIF_LOADER: u64 = 12;
@@ -341,7 +338,7 @@ struct App {
     font: Font,
     w: u32,
     h: u32,
-    hypr: Hypr,
+    desktop: Kwin,
     icons: IconResolver,
     /// Keys set by clients (`{"type":"set"}`), besides volume.
     store: BTreeMap<String, Value>,
@@ -1001,7 +998,7 @@ impl App {
         }
         let hypr = match &self.fake_hypr {
             Some(fake) => Some(fake),
-            None => self.hypr.connected().then_some(&self.hypr.state),
+            None => self.desktop.connected().then_some(&self.desktop.state),
         };
         let mut scene = scenes::bar_with(w, h, font, &layer, &mut self.icons, hypr)?;
         // `text` items show what clients have already set.
@@ -1026,7 +1023,7 @@ impl App {
         };
         let font = &self.font;
         match self.args.scene.as_str() {
-            "windows" => scenes::windows(w, h, font, &self.hypr.state, &mut self.icons, &shared),
+            "windows" => scenes::windows(w, h, font, &self.desktop.state, &mut self.icons, &shared),
             "bar" => {
                 let layer = self.args.layer.clone();
                 self.bar_scene(layer.as_deref())
@@ -1278,7 +1275,7 @@ impl App {
     /// commands run in the session: in their private runtime dir, theirs).
     fn desktop_socket(&self) -> Result<PathBuf> {
         let user = self.runner.user().ok_or_else(|| anyhow!("no session user (run_as)"))?;
-        let hypr = self.hypr.session_env().ok_or_else(|| anyhow!("Hyprland not connected"))?;
+        let hypr = self.desktop.session_env().ok_or_else(|| anyhow!("Hyprland not connected"))?;
         let env = user::session_env(user, Some(&hypr));
         let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         match (get("XDG_RUNTIME_DIR"), get("WAYLAND_DISPLAY")) {
@@ -1455,7 +1452,7 @@ impl App {
     /// Runs `hyprctl dispatch <expr>` with the syntax of the connected Hyprland's
     /// config provider. The result is checked in `on_hyprctl_finished`.
     fn hyprctl(&mut self, action: &HyprAction) {
-        let Some(provider) = self.hypr.provider.filter(|_| self.runner.has_hypr()) else {
+        let Some(provider) = self.desktop.provider.filter(|_| self.runner.has_hypr()) else {
             eprintln!("action: Hyprland not connected, ignoring {action:?}");
             return;
         };
@@ -1668,7 +1665,7 @@ impl App {
         if let Some(c) = &self.args.focus_class {
             return (c.clone(), String::new());
         }
-        let w = self.hypr.connected().then(|| self.hypr.state.focused_window()).flatten();
+        let w = self.desktop.connected().then(|| self.desktop.state.focused_window()).flatten();
         w.map_or_else(Default::default, |w| (w.class.clone(), w.title.clone()))
     }
 
@@ -1742,7 +1739,7 @@ impl App {
     fn hypr_state(&self) -> Option<&hypr::HyprState> {
         match &self.fake_hypr {
             Some(fake) => Some(fake),
-            None => self.hypr.connected().then_some(&self.hypr.state),
+            None => self.desktop.connected().then_some(&self.desktop.state),
         }
     }
 
@@ -2105,8 +2102,8 @@ fn main() -> Result<()> {
 
     if let Some(path) = args.png.clone() {
         // Preview without DRM: as a normal user we can still read our own Hyprland.
-        let mut hypr = Hypr::new(session.as_ref().map(|u| u.uid));
-        if let Err(e) = hypr.connect() {
+        let mut desktop = Kwin::new(session.as_ref().map(|u| u.uid));
+        if let Err(e) = desktop.connect() {
             eprintln!("hyprland: {e:#}");
         }
         let (w, h) = PREVIEW_SIZE;
@@ -2127,7 +2124,7 @@ fn main() -> Result<()> {
             follow_fn: false,
             touchbar_light: None,
         };
-        let mut app = new_app(parts, (w, h), hypr, home.as_deref())?;
+        let mut app = new_app(parts, (w, h), desktop, home.as_deref())?;
         match (app.args.level, app.args.expand.clone()) {
             (Some(level), class) => app.level_preview(level, class.as_deref())?,
             (None, Some(p)) if p == "player" => {
@@ -2213,8 +2210,8 @@ fn main() -> Result<()> {
             }
         };
         let brightness = backlight.as_mut().and_then(|b| b.read_percent().ok());
-        let mut hypr = Hypr::new(session.as_ref().map(|u| u.uid));
-        if let Err(e) = hypr.connect() {
+        let mut desktop = Kwin::new(session.as_ref().map(|u| u.uid));
+        if let Err(e) = desktop.connect() {
             eprintln!("hyprland: {e:#}; waiting for it to start");
         }
         let parts = AppParts {
@@ -2236,7 +2233,7 @@ fn main() -> Result<()> {
                     None
                 }),
         };
-        let mut app = new_app(parts, (w, h), hypr, home.as_deref())?;
+        let mut app = new_app(parts, (w, h), desktop, home.as_deref())?;
         app.idle.follow_desktop = true;
         app.sync_desktop_idle(true);
         let result = run(&mut drm, &sigfd, &mut touch, &mut ipc, &mut app);
@@ -2272,9 +2269,9 @@ struct AppParts {
     touchbar_light: Option<PathBuf>,
 }
 
-fn new_app(p: AppParts, (w, h): (u32, u32), hypr: Hypr, home: Option<&Path>) -> Result<App> {
+fn new_app(p: AppParts, (w, h): (u32, u32), desktop: Kwin, home: Option<&Path>) -> Result<App> {
     let mut runner = Runner::new(p.session);
-    runner.set_hypr(hypr.session_env());
+    runner.set_hypr(desktop.session_env());
     let epoch = Instant::now();
     let mut app = App {
         args: p.args,
@@ -2283,7 +2280,7 @@ fn new_app(p: AppParts, (w, h): (u32, u32), hypr: Hypr, home: Option<&Path>) -> 
         font: p.font,
         w,
         h,
-        hypr,
+        desktop,
         icons: IconResolver::new(home, scenes::icon_size(h)),
         store: BTreeMap::new(),
         volume: 50,
@@ -2432,50 +2429,33 @@ fn drain_timer(timer: &TimerFd) -> Result<()> {
     }
 }
 
-/// Starts/stops watching Hyprland: the event socket while connected; while not, the
-/// directories a new instance would appear in (or, if that can't be set up, a retry
-/// timer). Closed fds leave the epoll set by themselves. Also tells the runner which
-/// instance commands should talk to.
-fn watch_hypr(
-    epoll: &Epoll,
-    app: &mut App,
-    retry: &TimerFd,
-    watch: &mut Option<InstanceWatch>,
-) -> Result<()> {
-    if app.hypr.event_fd().is_none() && watch.is_none() {
-        match InstanceWatch::new(Path::new(hyprwatch::RUN_USER)) {
-            Ok(w) => {
-                epoll.add(
-                    w.inotify_fd(),
-                    EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_HYPR_WATCH),
-                )?;
-                epoll.add(
-                    w.mounts_fd(),
-                    EpollEvent::new(EpollFlags::EPOLLPRI, TOKEN_HYPR_MOUNTS),
-                )?;
-                *watch = Some(w);
-                // It may have started between the last attempt and the watch.
-                let _ = app.hypr.connect();
-            }
+/// Starts/stops watching the desktop source: the session bus while connected;
+/// while not, a retry timer. KWin (unlike Hyprland) has no per-instance runtime
+/// directory to watch for, so a session bus that appears late is noticed by the
+/// timer. Closed fds leave the epoll set by themselves. Also tells the runner
+/// which session commands should talk to.
+fn watch_desktop(epoll: &Epoll, app: &mut App, retry: &TimerFd) -> Result<()> {
+    if app.desktop.event_fd().is_none() {
+        match app.desktop.connect() {
+            Ok(()) => {}
             Err(e) => {
                 eprintln!(
-                    "hyprland: can't watch for it ({e:#}); retrying every {}s",
-                    HYPR_RETRY.as_secs()
+                    "desktop: not connected ({e:#}); retrying every {}s",
+                    DESKTOP_RETRY.as_secs()
                 );
                 retry.set(
-                    Expiration::Interval(TimeSpec::from_duration(HYPR_RETRY)),
+                    Expiration::Interval(TimeSpec::from_duration(DESKTOP_RETRY)),
                     TimerSetTimeFlags::empty(),
                 )?;
             }
         }
     }
-    app.runner.set_hypr(app.hypr.session_env());
-    // Hyprland came or went: the desktop's idle comes from it.
+    app.runner.set_hypr(app.desktop.session_env());
+    // The desktop came or went: the desktop's idle comes from it.
     app.sync_desktop_idle(false);
-    if let Some(fd) = app.hypr.event_fd() {
-        epoll.add(fd, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_HYPR))?;
+    if let Some(fd) = app.desktop.event_fd() {
+        epoll.add(fd, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_DESKTOP))?;
         retry.unset()?;
-        *watch = None;
     }
     Ok(())
 }
@@ -2558,7 +2538,7 @@ fn run(
     epoll.add(&timer, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_TIMER))?;
     epoll.add(
         &retry,
-        EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_HYPR_RETRY),
+        EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_DESKTOP_RETRY),
     )?;
     epoll.add(&*touch, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_TOUCH))?;
     epoll.add(
@@ -2575,8 +2555,7 @@ fn run(
     if let Some(l) = &app.loader {
         epoll.add(l.fd(), EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_GIF_LOADER))?;
     }
-    let mut hypr_watch: Option<InstanceWatch> = None;
-    watch_hypr(&epoll, app, &retry, &mut hypr_watch)?;
+    watch_desktop(&epoll, app, &retry)?;
 
     let (w, h) = drm.canvas_size();
     let mut canvas = Canvas::new(w, h)?;
@@ -2944,14 +2923,14 @@ fn run(
                                 }
                             }
                             UiEvent::Workspace(_, ws) => {
-                                if let Err(e) = app.hypr.dispatch_workspace(ws) {
+                                if let Err(e) = app.desktop.dispatch_workspace(ws) {
                                     eprintln!("workspaces: {e:#}");
                                 }
                             }
                             UiEvent::FocusWindow(item, addr) => {
                                 // Focus first: its buttons (if any) work once
                                 // Hyprland says the window has it.
-                                if let Err(e) = app.hypr.dispatch_focus_window(addr) {
+                                if let Err(e) = app.desktop.dispatch_focus_window(addr) {
                                     eprintln!("workspaces: {e:#}");
                                 }
                                 dirty |= app.open_app_row(item, addr, true);
@@ -2961,15 +2940,15 @@ fn run(
                         }
                     }
                 }
-                TOKEN_HYPR => match app.hypr.read() {
+                TOKEN_DESKTOP => match app.desktop.read() {
                     ReadOutcome::Changed => {
                         // Workspaces items redraw only if what they show changed.
                         let t = Instant::now() - start;
-                        let (st, font) = (&app.hypr.state, &app.font);
+                        let (st, font) = (&app.desktop.state, &app.font);
                         dirty |= app.scene.set_workspaces(st, t, font, &mut app.icons);
                         dirty |= app.sync_app_keys();
                         dirty |= app.sync_app_rows();
-                        let st = &app.hypr.state;
+                        let st = &app.desktop.state;
                         let focused = st
                             .focused_window()
                             .map_or("-".to_string(), |w| format!("{} {:?}", w.class, w.title));
@@ -2986,32 +2965,19 @@ fn run(
                     }
                     ReadOutcome::Unchanged => {}
                     ReadOutcome::Disconnected => {
-                        eprintln!("hyprland: lost, waiting for it to start again");
-                        watch_hypr(&epoll, app, &retry, &mut hypr_watch)?;
+                        eprintln!("desktop: lost, waiting for it to start again");
+                        watch_desktop(&epoll, app, &retry)?;
                         app.rebuild()?;
                         dirty = true;
                     }
                 },
-                TOKEN_HYPR_RETRY => {
+                TOKEN_DESKTOP_RETRY => {
                     drain_timer(&retry)?;
-                    // Quiet on failure: in fallback mode this runs every few seconds.
-                    if app.hypr.connect().is_ok() {
-                        watch_hypr(&epoll, app, &retry, &mut hypr_watch)?;
+                    // Quiet on failure: this runs every few seconds until a session bus appears.
+                    watch_desktop(&epoll, app, &retry)?;
+                    if app.desktop.connected() {
                         app.rebuild()?;
                         dirty = true;
-                    }
-                }
-                TOKEN_HYPR_WATCH | TOKEN_HYPR_MOUNTS => {
-                    let Some(watch) = &hypr_watch else {
-                        continue;
-                    };
-                    watch.refresh();
-                    if app.hypr.connect().is_ok() {
-                        watch_hypr(&epoll, app, &retry, &mut hypr_watch)?;
-                        app.rebuild()?;
-                        dirty = true;
-                    } else {
-                        arm_once(&retry, HYPR_SETTLE)?;
                     }
                 }
                 TOKEN_VOLUME_MONITOR => {
@@ -3122,7 +3088,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap()
+        new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap()
     }
 
     fn x_of(app: &App, id: &str) -> f32 {
@@ -3240,7 +3206,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap()
+        new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap()
     }
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
@@ -3497,7 +3463,7 @@ mod tests {
             // Opened below, with its own state file: never /var/lib's.
             touchbar_light: None,
         };
-        let mut app = new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap();
+        let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
         app.state = state::StateFile::at(dir.join("state.toml"), true);
         app.idle.light_dir = Some(light);
         let t0 = app.epoch;
@@ -3594,7 +3560,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        let mut app = new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap();
+        let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
         app.state = state::StateFile::at(dir.join("state.toml"), true);
         app.idle.light_dir = Some(dir.join("light"));
         let t0 = app.epoch;
@@ -3764,10 +3730,10 @@ mod tests {
         let dir = tmp("idle-desktop-live");
         let (mut app, _) = idle_app(&dir, IDLE);
         let uid = nix::unistd::getuid().as_raw();
-        app.hypr = Hypr::new(Some(uid));
-        app.hypr.connect().unwrap();
+        app.desktop = Kwin::new(Some(uid));
+        app.desktop.connect().unwrap();
         app.runner.set_user(Some(user::SessionUser::from_uid(uid).unwrap()));
-        app.runner.set_hypr(app.hypr.session_env());
+        app.runner.set_hypr(app.desktop.session_env());
         app.idle.follow_desktop = true;
         let t0 = Instant::now();
         app.sync_idle(t0);
@@ -3976,7 +3942,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        let mut app = new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap();
+        let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
         app.state = state::StateFile::at(dir.join("state.toml"), false);
         pump(&mut app, |a| !a.pickers["gif_picker"].entries.is_empty());
         app
@@ -4160,7 +4126,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        let mut app = new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap();
+        let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
         app.state = state::StateFile::at(dir.join("state.toml"), false);
         pump(&mut app, |a| !a.pickers["gif_picker"].entries.is_empty());
         let names: Vec<String> = app.pickers["gif_picker"].entries.iter().map(|(n, _, _)| n.clone()).collect();
@@ -4224,7 +4190,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap()
+        new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap()
     }
 
     /// Hyprland says `class` has the focus now.
@@ -4348,7 +4314,7 @@ mod tests {
             follow_fn: false,
             touchbar_light: None,
         };
-        let mut app = new_app(parts, PREVIEW_SIZE, Hypr::new(None), None).unwrap();
+        let mut app = new_app(parts, PREVIEW_SIZE, Kwin::new(None), None).unwrap();
         app.fake_hypr = Some(crate::workspaces::tests::state());
         app.rebuild().unwrap();
         app
