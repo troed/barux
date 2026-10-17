@@ -29,10 +29,22 @@ function desktopList() {
     return out;
 }
 
-// The desktop a window is filed under: the first of its desktops, else 0.
+// Only the ordinary application windows the strip shows: not docks/panels,
+// popups, menus, tooltips, notifications or windows KWin is keeping alive for
+// the close animation.
+function isAppWindow(win) {
+    return win.normalWindow === true && !win.deleted;
+}
+
+// The desktop a window is filed under: its first desktop; a window on all
+// desktops (or none, including pinned ones) counts as the current one, so it is
+// not dropped.
 function windowDesktop(win) {
     var desktops = win.desktops || [];
-    return desktops.length > 0 ? desktops[0].x11DesktopNumber : 0;
+    if (desktops.length > 0) {
+        return desktops[0].x11DesktopNumber;
+    }
+    return currentPosition();
 }
 
 // The class barux matches on: KWin's resourceClass, with resourceName and the
@@ -59,6 +71,9 @@ function snapshot() {
     var list = workspace.windowList();
     for (var i = 0; i < list.length; i++) {
         var w = list[i];
+        if (!isAppWindow(w)) {
+            continue;
+        }
         windows.push({
             id: String(w.internalId),
             class: windowClass(w),

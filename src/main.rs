@@ -396,6 +396,9 @@ struct App {
     /// The desktop state as made up by `--expand`/`--level` (previews) and tests,
     /// used instead of the live one. (The neutral `HyprState` type is reused.)
     fake_desktop: Option<hypr::HyprState>,
+    /// Whether "desktop: not connected" has been logged since the last successful
+    /// attempt (so a retry loop that lasts a boot stays quiet).
+    desktop_retry_logged: bool,
 }
 
 /// The bar at rest (`[idle]`).
@@ -2351,6 +2354,7 @@ fn new_app(p: AppParts, (w, h): (u32, u32), desktop: Kwin, home: Option<&Path>) 
         },
         cross_fade: None,
         fake_desktop: None,
+        desktop_retry_logged: false,
     };
     app.sync_mpv();
     app.sync_recorder();
@@ -2467,10 +2471,13 @@ fn watch_desktop(epoll: &Epoll, app: &mut App, retry: &TimerFd) -> Result<()> {
         match app.desktop.connect() {
             Ok(()) => {}
             Err(e) => {
-                eprintln!(
-                    "desktop: not connected ({e:#}); retrying every {}s",
-                    DESKTOP_RETRY.as_secs()
-                );
+                if !app.desktop_retry_logged {
+                    eprintln!(
+                        "desktop: not connected ({e:#}); retrying every {}s",
+                        DESKTOP_RETRY.as_secs()
+                    );
+                    app.desktop_retry_logged = true;
+                }
                 retry.set(
                     Expiration::Interval(TimeSpec::from_duration(DESKTOP_RETRY)),
                     TimerSetTimeFlags::empty(),
@@ -2482,6 +2489,7 @@ fn watch_desktop(epoll: &Epoll, app: &mut App, retry: &TimerFd) -> Result<()> {
     // The desktop came or went: the desktop's idle comes from it.
     app.sync_desktop_idle(false);
     if let Some(fd) = app.desktop.event_fd() {
+        app.desktop_retry_logged = false;
         epoll.add(fd, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_DESKTOP))?;
         retry.unset()?;
     }

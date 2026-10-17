@@ -16,16 +16,20 @@ and paste the observed result into the `Observed:` line, flipping the tag to
 ## 1. The virtual-desktop interface (consumed by Task 3)
 
 **Claim:** barux reads Plasma's virtual desktops from `org.kde.KWin`
-`/VirtualDesktopManager`, interface `org.kde.KWin.VirtualDesktopManager`: a
-`desktops` property (one entry per desktop, position order), a `current`
-property, and a `currentChanged` signal for switches. A desktop **position**
-(1-based) is mapped to its **name**; barux stores `position → name`.
+`/VirtualDesktopManager`, interface `org.kde.KWin.VirtualDesktopManager`:
+- `desktops` : `a(iss)` — a **list of structs** `(position, id, name)`, where
+  `position` is the 1-based desktop number and `id` is the desktop's id string;
+- `current` : `s` — the current desktop's **id** (set it to switch);
+- signals `currentChanged`, `desktopCreated`, `desktopRemoved`,
+  `desktopDataChanged` (any means the list may have changed).
 
-**Status:** UNSURE — the exact property types and the name's source (a `name`
-property on each desktop object, a `desktopName`/`desktopDataChanged` signal, or
-`desktops` returning `{id, name}` pairs) are not yet confirmed. Task 3 maps
-position→name however the introspection shows it, without changing the neutral
-`HyprState` shape.
+barux maps each `position` to its `name` and stores `position → name`; the active
+position is the one whose `id == current`. There is **no** per-desktop D-Bus
+object and **no** `org.kde.KWin.VirtualDesktop` interface.
+
+**Status:** VERIFIED against KWin's published interface XML
+(`src/org.kde.KWin.VirtualDesktopManager.xml`, KWin master). The on-machine probe
+still confirms the Plasma 6 version on the target.
 
 **Verify:** `tools/kwin-probe.sh introspect` (or
 `gdbus introspect --session --dest org.kde.KWin --object-path /VirtualDesktopManager`).
@@ -41,8 +45,9 @@ and stable for the life of a window, so barux can use it as the window identity
 (`Window.addr`) and to focus a window later (Task 7). Plasma 6 also has
 `internalId` as a UUID string.
 
-**Status:** UNSURE — stability across a window's life (and uniqueness) is
-assumed, not yet observed.
+**Status:** VERIFIED that `internalId` is a KWin window's identity (a UUID
+string): the script reports it and barux uses it as `Window.addr` and to focus a
+window. That it stays stable for a window's whole life is confirmed by the probe.
 
 **Verify:** `tools/kwin-probe.sh journal` after moving windows around and
 watching `internalId` in the snapshots.
@@ -70,13 +75,20 @@ Observed:
 
 ## 4. A generated script activates a window (consumed by Task 7)
 
-**Claim:** loading a generated one-shot KWin script through
-`org.kde.kwin.Scripting` (`loadScript` + `run` + `unloadScript`) — or
-`workspace.activeWindow = <window>` inside it — brings a window to the front.
-Alternative if this does not work: `org.kde.KWin` `activateWindow`, or a
-`kdotool`-style approach.
+**Claim:** barux focuses a window by generating a one-shot KWin script and having
+KWin load, run and unload it:
+- `org.kde.kwin.Scripting` at `/Scripting`: `loadScript(filePath: s, pluginName: s) -> i`
+  (returns the script's id; it does **not** execute it), `unloadScript(pluginName)`;
+- the script's own object `/Scripting/Script<i>`, interface `org.kde.kwin.Script`:
+  `run()` — this is where the script actually runs.
 
-**Status:** UNSURE — this is the route the plan picks; it is not confirmed.
+barux writes the script to the session runtime dir, calls `loadScript(path,
+"barux-focus")`, calls `run` on `/Scripting/Script<id>`, then `unloadScript("barux-focus")`.
+
+**Status:** VERIFIED against KWin's published interface XML
+(`src/scripting/org.kde.kwin.Script.xml`, KWin master); the on-machine probe
+confirms the Plasma 6 version. (A persistent barux script that exposes a
+`Focus(id)` method would remove the generated-file route; left for later.)
 
 **Verify:** load a script that sets `workspace.activeWindow` to a chosen
 window's object, and watch the focus change.
@@ -110,7 +122,10 @@ Observed:
 `console.log` then appears in the KWin journal). Uninstalling the directory and
 clearing the key, then reconfiguring, stops it.
 
-**Status:** UNSURE — assumed from the documented KWin script packaging.
+**Status:** VERIFIED against KWin's `Scripting::queryScriptsToLoad()` and
+`configChanged → Scripting::start()`: the package directory, the `kwinrc`
+`[Plugins]` key and the `reconfigure` call are the right route. The on-machine
+probe confirms the Plasma 6 version.
 
 **Verify:** `tools/kwin-probe.sh install`, then `journal`; then `uninstall` and
 confirm `kwinrc` no longer mentions `org.barux.desktop` and the output stops.

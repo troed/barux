@@ -24,7 +24,11 @@ use zbus::zvariant::Value;
 const DEST: &str = "org.kde.KWin";
 const VDM_PATH: &str = "/VirtualDesktopManager";
 const VDM_IFACE: &str = "org.kde.KWin.VirtualDesktopManager";
-const VDESK_IFACE: &str = "org.kde.KWin.VirtualDesktop";
+/// A loaded script's own object: `run` lives here, not on `/Scripting`.
+const SCRIPT_PATH_PREFIX: &str = "/Scripting/Script";
+const SCRIPT_IFACE: &str = "org.kde.kwin.Script";
+/// The plugin name barux loads its generated one-shot focus scripts under.
+const FOCUS_PLUGIN: &str = "barux-focus";
 /// Any of these means the desktop list may have changed: re-read it (event-driven;
 /// no timer). `currentChanged` is the switch; the rest are add/remove/rename.
 const VDM_SIGNALS: [&str; 4] = [
@@ -202,29 +206,27 @@ impl Kwin {
         self.state.focused = snap.focused;
     }
 
-    /// Re-reads the virtual desktops (position -> name) and the current one from
-    /// `org.kde.KWin.VirtualDesktopManager`. Returns whether `state` changed.
+    /// Re-reads the virtual desktops and the current one from
+    /// `org.kde.KWin.VirtualDesktopManager`. `desktops` is `a(iss)` — each entry is
+    /// (position, id, name) — and `current` is the current desktop's id. Returns
+    /// whether `state` changed.
     fn read_desktops(&mut self) -> Result<bool> {
         let bus = self
             .bus
             .as_ref()
             .ok_or_else(|| anyhow!("desktop not connected"))?;
-        let conn = bus.connection();
-        let vdm = Proxy::new(conn, DEST, VDM_PATH, VDM_IFACE)?;
-        let ids: Vec<String> = vdm.get_property("desktops")?;
+        let vdm = Proxy::new(bus.connection(), DEST, VDM_PATH, VDM_IFACE)?;
+        let desktops: Vec<(i32, String, String)> = vdm.get_property("desktops")?;
         let current: String = vdm.get_property("current")?;
         let mut workspaces = BTreeMap::new();
-        for (i, id) in ids.iter().enumerate() {
-            // Position is the order; the name is each desktop's own property.
-            let name: String = Proxy::new(conn, DEST, format!("{VDM_PATH}/{id}"), VDESK_IFACE)
-                .and_then(|d| d.get_property("name"))
-                .unwrap_or_default();
-            workspaces.insert(i as i64 + 1, name);
+        let mut active = None;
+        for (position, id, name) in desktops {
+            let position = position as i64;
+            workspaces.insert(position, name);
+            if id == current {
+                active = Some(position);
+            }
         }
-        let active = ids
-            .iter()
-            .position(|id| id == &current)
-            .map(|i| i as i64 + 1);
         let changed =
             self.state.workspaces != workspaces || self.state.active_workspace != active;
         self.state.workspaces = workspaces;
@@ -254,11 +256,12 @@ impl Kwin {
             .as_ref()
             .ok_or_else(|| anyhow!("desktop not connected"))?;
         let vdm = Proxy::new(bus.connection(), DEST, VDM_PATH, VDM_IFACE)?;
-        let ids: Vec<String> = vdm.get_property("desktops")?;
-        let target = ids
-            .get((position - 1) as usize)
+        let desktops: Vec<(i32, String, String)> = vdm.get_property("desktops")?;
+        let target = desktops
+            .into_iter()
+            .find(|(p, _, _)| *p as i64 == position)
             .ok_or_else(|| anyhow!("no virtual desktop at position {position}"))?;
-        vdm.set_property("current", target.clone())?;
+        vdm.set_property("current", target.1)?;
         Ok(())
     }
 
@@ -279,15 +282,14 @@ impl Kwin {
         std::fs::write(&path, focus_script(&addr))
             .with_context(|| format!("writing {}", path.display()))?;
         let path = path.to_string_lossy().to_string();
-        bus.call(
-            DEST,
-            SCRIPTING_PATH,
-            SCRIPTING_IFACE,
-            "loadScript",
-            &[Value::from(path.as_str())],
-        )?;
-        // A later tap may retry; failing to run or unload is logged, not fatal.
-        if let Err(e) = bus.call(DEST, SCRIPTING_PATH, SCRIPTING_IFACE, "run", &[]) {
+        // `loadScript(filePath, pluginName)` returns the script's id; `run` lives on
+        // that script's own object (`org.kde.kwin.Script`), not on `/Scripting`.
+        let id: i32 = Proxy::new(bus.connection(), DEST, SCRIPTING_PATH, SCRIPTING_IFACE)?
+            .call("loadScript", &(path.as_str(), FOCUS_PLUGIN))?;
+        let script_path = format!("{SCRIPT_PATH_PREFIX}{id}");
+        if let Err(e) = Proxy::new(bus.connection(), DEST, script_path.as_str(), SCRIPT_IFACE)
+            .and_then(|p| p.call::<_, _, ()>("run", &()))
+        {
             eprintln!("desktop: running the focus script: {e:#}");
         }
         if let Err(e) = bus.call(
@@ -295,7 +297,7 @@ impl Kwin {
             SCRIPTING_PATH,
             SCRIPTING_IFACE,
             "unloadScript",
-            &[Value::from(path.as_str())],
+            &[Value::from(FOCUS_PLUGIN)],
         ) {
             eprintln!("desktop: unloading the focus script: {e:#}");
         }
@@ -441,9 +443,6 @@ mod tests {
     }
 
     impl VdmState {
-        fn ids(&self) -> Vec<String> {
-            self.desktops.iter().map(|(p, _)| p.to_string()).collect()
-        }
         fn current_id(&self) -> String {
             self.current.to_string()
         }
@@ -456,8 +455,14 @@ mod tests {
     #[zbus::interface(name = "org.kde.KWin.VirtualDesktopManager")]
     impl VdmIface {
         #[zbus(property, name = "desktops")]
-        fn desktops(&self) -> Vec<String> {
-            self.state.lock().unwrap().ids()
+        fn desktops(&self) -> Vec<(i32, String, String)> {
+            self.state
+                .lock()
+                .unwrap()
+                .desktops
+                .iter()
+                .map(|(p, n)| (*p as i32, p.to_string(), n.clone()))
+                .collect()
         }
 
         #[zbus(property, name = "current")]
@@ -473,7 +478,8 @@ mod tests {
         }
     }
 
-    /// The fake KWin scripting interface: records each loaded script's text.
+    /// The fake KWin scripting interface: records each loaded script's text. `run`
+    /// lives on the script object (`ScriptIface`), as in KWin.
     struct ScriptingIface {
         scripts: Arc<Mutex<Vec<String>>>,
     }
@@ -481,18 +487,24 @@ mod tests {
     #[zbus::interface(name = "org.kde.kwin.Scripting")]
     impl ScriptingIface {
         #[zbus(name = "loadScript")]
-        fn load_script(&self, path: String) -> i32 {
+        fn load_script(&self, path: String, _plugin: String) -> i32 {
             let body = std::fs::read_to_string(&path).unwrap_or_default();
             let mut scripts = self.scripts.lock().unwrap();
             scripts.push(body);
-            scripts.len() as i32
+            1
         }
 
+        #[zbus(name = "unloadScript")]
+        fn unload_script(&self, _plugin: String) {}
+    }
+
+    /// A loaded script's own object, where `run` lives (`/Scripting/Script<i>`).
+    struct ScriptIface;
+
+    #[zbus::interface(name = "org.kde.kwin.Script")]
+    impl ScriptIface {
         #[zbus(name = "run")]
         fn run(&self) {}
-
-        #[zbus(name = "unloadScript")]
-        fn unload_script(&self, _path: String) {}
     }
 
     /// The fake global-shortcut component: records the shortcuts invoked.
@@ -505,18 +517,6 @@ mod tests {
         #[zbus(name = "invokeShortcut")]
         fn invoke_shortcut(&self, name: String) {
             self.shortcuts.lock().unwrap().push(name);
-        }
-    }
-
-    struct DeskIface {
-        name: String,
-    }
-
-    #[zbus::interface(name = "org.kde.KWin.VirtualDesktop")]
-    impl DeskIface {
-        #[zbus(property, name = "name")]
-        fn name(&self) -> String {
-            self.name.clone()
         }
     }
 
@@ -595,6 +595,12 @@ mod tests {
             .object_server()
             .at(SCRIPTING_PATH, ScriptingIface { scripts })
             .unwrap();
+        // The script object `loadScript` returns (id 1 in this fake), where `run` is.
+        server
+            .connection()
+            .object_server()
+            .at("/Scripting/Script1", ScriptIface)
+            .unwrap();
         server.connection().request_name(KGLOBALACCEL).unwrap();
         server
             .connection()
@@ -623,18 +629,6 @@ mod tests {
                 },
             )
             .unwrap();
-        for (pos, name) in desktops {
-            server
-                .connection()
-                .object_server()
-                .at(
-                    format!("{VDM_PATH}/{pos}"),
-                    DeskIface {
-                        name: name.to_string(),
-                    },
-                )
-                .unwrap();
-        }
         serve_actions(&server, Arc::clone(&scripts), Arc::clone(&shortcuts));
         Fake {
             _daemon: d,
