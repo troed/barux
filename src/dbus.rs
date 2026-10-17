@@ -18,7 +18,7 @@ use std::{
 use zbus::{
     blocking::{Connection, Proxy, connection::Builder},
     object_server::Interface,
-    zvariant::{OwnedValue, StructureBuilder, Value},
+    zvariant::{StructureBuilder, Value},
 };
 
 /// A hung desktop must not freeze the bar: calls give up after this.
@@ -125,8 +125,11 @@ impl Bus {
             .unwrap_or_default()
     }
 
-    /// Calls `method` on `iface` at `path` with `args`, returning the reply's one
-    /// body value (a placeholder when the method returns nothing).
+    /// Calls `method` on `iface` at `path` with `args`. The reply's value is not
+    /// returned: every call site here is a fire-and-forget dispatch, and property
+    /// reads use a typed `zbus` proxy instead. (The plan sketched an `OwnedValue`
+    /// return; deserializing a bare non-variant reply proved unreliable and no
+    /// caller needs it.)
     pub fn call(
         &self,
         dest: &str,
@@ -134,22 +137,16 @@ impl Bus {
         iface: &str,
         method: &str,
         args: &[Value<'_>],
-    ) -> Result<OwnedValue> {
+    ) -> Result<()> {
         let mut builder = StructureBuilder::new();
         for a in args {
             builder = builder.append_field(a.try_clone()?);
         }
         let body = builder.build().context("building the call arguments")?;
-        let reply = self
-            .conn
+        self.conn
             .call_method(Some(dest), path, Some(iface), method, &body)
             .with_context(|| format!("{iface}.{method}"))?;
-        let body = reply.body();
-        if body.is_empty() {
-            // A void method (e.g. a dispatch): no value to give back.
-            return Ok(OwnedValue::from(0u8));
-        }
-        body.deserialize::<OwnedValue>().map_err(Into::into)
+        Ok(())
     }
 
     /// Serves `iface` at `path` and takes `name` on the bus.

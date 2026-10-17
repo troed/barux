@@ -11,11 +11,13 @@ use crate::dbus::{Bus, Notice, Notifier};
 use crate::hypr::{HyprState as DesktopState, ReadOutcome, Window};
 use crate::hyprctl::ConfigProvider;
 use crate::user::{HyprEnv, SessionUser};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::os::fd::BorrowedFd;
+use std::path::PathBuf;
 use zbus::blocking::Proxy;
+use zbus::zvariant::Value;
 
 /// KWin's virtual-desktop interface (Plasma 6). See `docs/kwin-notes.md`: the exact
 /// property signatures are UNSURE until `tools/kwin-probe.sh` is run on a session.
@@ -35,6 +37,13 @@ const VDM_SIGNALS: [&str; 4] = [
 const BARUX_NAME: &str = "org.barux.KWin";
 const BARUX_PATH: &str = "/KWin";
 const BARUX_IFACE: &str = "org.barux.KWin";
+/// KWin's scripting interface: load a generated one-shot script, run it, unload it.
+const SCRIPTING_PATH: &str = "/Scripting";
+const SCRIPTING_IFACE: &str = "org.kde.kwin.Scripting";
+/// The global-shortcut service: invoke KWin's "Overview".
+const KGLOBALACCEL: &str = "org.kde.kglobalaccel";
+const KGLOBALACCEL_PATH: &str = "/component/kwin";
+const KGLOBALACCEL_IFACE: &str = "org.kde.kglobalaccel.Component";
 
 /// A KWin window id as the bar sends it: the KWin script's `internalId`, a
 /// UUID-like string (`docs/kwin-notes.md` §2, UNSURE). Any non-empty, printable,
@@ -44,6 +53,17 @@ pub fn window_arg(id: &str) -> Result<String> {
         bail!("bad window id {id:?}");
     }
     Ok(id.to_string())
+}
+
+/// The one-shot KWin script that focuses the window with `addr` (its `internalId`):
+/// generated, then loaded, run and unloaded at once.
+fn focus_script(addr: &str) -> String {
+    format!(
+        "// barux: focus one window (generated; loaded, run and unloaded at once).\n\
+         const id = {addr:?};\n\
+         const w = workspace.windowList().find(function (w) {{ return String(w.internalId) === id; }});\n\
+         if (w) {{\n    workspace.activeWindow = w;\n}}\n"
+    )
 }
 
 /// The live KWin desktop source. While it is not connected, `state` is empty, so
@@ -62,6 +82,9 @@ pub struct Kwin {
     /// Whether a KWin script snapshot has been seen: once it has, it is the live
     /// source for the desktop list too (the D-Bus read is the pre-script fallback).
     have_snapshot: bool,
+    /// Where generated one-shot scripts are written (the session user's runtime
+    /// directory; tests override it).
+    script_dir: Option<PathBuf>,
 }
 
 impl Kwin {
@@ -73,6 +96,7 @@ impl Kwin {
             state: DesktopState::default(),
             announced: DesktopState::default(),
             have_snapshot: false,
+            script_dir: None,
         }
     }
 
@@ -216,15 +240,88 @@ impl Kwin {
         self.have_snapshot = false;
     }
 
-    /// Switches to the virtual desktop `id`. Task 7 wires the D-Bus write (and
-    /// validates `id`); until then the action fails like a disconnected desktop.
-    pub fn dispatch_workspace(&self, _id: &str) -> Result<()> {
-        bail!("switching desktops is not implemented yet")
+    /// Switches to the virtual desktop at the bar's position `id` (1-based, as a
+    /// string): writes `current` on `/VirtualDesktopManager` to that desktop's id.
+    pub fn dispatch_workspace(&self, id: &str) -> Result<()> {
+        let position: i64 = id
+            .trim()
+            .parse()
+            .ok()
+            .filter(|p| *p >= 1)
+            .ok_or_else(|| anyhow!("bad workspace id {id:?}"))?;
+        let bus = self
+            .bus
+            .as_ref()
+            .ok_or_else(|| anyhow!("desktop not connected"))?;
+        let vdm = Proxy::new(bus.connection(), DEST, VDM_PATH, VDM_IFACE)?;
+        let ids: Vec<String> = vdm.get_property("desktops")?;
+        let target = ids
+            .get((position - 1) as usize)
+            .ok_or_else(|| anyhow!("no virtual desktop at position {position}"))?;
+        vdm.set_property("current", target.clone())?;
+        Ok(())
     }
 
-    /// Focuses the window with `addr`. Task 7 loads a generated KWin script.
-    pub fn dispatch_focus_window(&self, _addr: &str) -> Result<()> {
-        bail!("focusing windows is not implemented yet")
+    /// Focuses the window with `addr` (the KWin script's `internalId`): writes a
+    /// one-shot KWin script to the runtime dir and has KWin load, run and unload it.
+    pub fn dispatch_focus_window(&self, addr: &str) -> Result<()> {
+        let addr = window_arg(addr)?;
+        let bus = self
+            .bus
+            .as_ref()
+            .ok_or_else(|| anyhow!("desktop not connected"))?;
+        let dir = self
+            .script_dir
+            .clone()
+            .or_else(|| self.session_runtime_dir())
+            .ok_or_else(|| anyhow!("no runtime directory to write the focus script into"))?;
+        let path = dir.join(format!("barux-focus-{addr}.js"));
+        std::fs::write(&path, focus_script(&addr))
+            .with_context(|| format!("writing {}", path.display()))?;
+        let path = path.to_string_lossy().to_string();
+        bus.call(
+            DEST,
+            SCRIPTING_PATH,
+            SCRIPTING_IFACE,
+            "loadScript",
+            &[Value::from(path.as_str())],
+        )?;
+        // A later tap may retry; failing to run or unload is logged, not fatal.
+        if let Err(e) = bus.call(DEST, SCRIPTING_PATH, SCRIPTING_IFACE, "run", &[]) {
+            eprintln!("desktop: running the focus script: {e:#}");
+        }
+        if let Err(e) = bus.call(
+            DEST,
+            SCRIPTING_PATH,
+            SCRIPTING_IFACE,
+            "unloadScript",
+            &[Value::from(path.as_str())],
+        ) {
+            eprintln!("desktop: unloading the focus script: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Shows/hides KWin's Overview: invokes its `Overview` global shortcut.
+    pub fn overview(&self) -> Result<()> {
+        let bus = self
+            .bus
+            .as_ref()
+            .ok_or_else(|| anyhow!("desktop not connected"))?;
+        bus.call(
+            KGLOBALACCEL,
+            KGLOBALACCEL_PATH,
+            KGLOBALACCEL_IFACE,
+            "invokeShortcut",
+            &[Value::from("Overview")],
+        )?;
+        Ok(())
+    }
+
+    /// The session user's runtime directory (where generated scripts go).
+    fn session_runtime_dir(&self) -> Option<PathBuf> {
+        let uid = self.preferred_uid?;
+        SessionUser::from_uid(uid).ok().map(|u| u.runtime_dir())
     }
 
     /// What commands need to talk to this desktop: the Wayland socket. KWin has no
@@ -371,6 +468,48 @@ mod tests {
         fn current(&self) -> String {
             self.state.lock().unwrap().current_id()
         }
+
+        #[zbus(property, name = "current")]
+        fn set_current(&self, value: String) {
+            if let Ok(position) = value.parse::<i64>() {
+                self.state.lock().unwrap().current = position;
+            }
+        }
+    }
+
+    /// The fake KWin scripting interface: records each loaded script's text.
+    struct ScriptingIface {
+        scripts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.kwin.Scripting")]
+    impl ScriptingIface {
+        #[zbus(name = "loadScript")]
+        fn load_script(&self, path: String) -> i32 {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut scripts = self.scripts.lock().unwrap();
+            scripts.push(body);
+            scripts.len() as i32
+        }
+
+        #[zbus(name = "run")]
+        fn run(&self) {}
+
+        #[zbus(name = "unloadScript")]
+        fn unload_script(&self, _path: String) {}
+    }
+
+    /// The fake global-shortcut component: records the shortcuts invoked.
+    struct ComponentIface {
+        shortcuts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.kglobalaccel.Component")]
+    impl ComponentIface {
+        #[zbus(name = "invokeShortcut")]
+        fn invoke_shortcut(&self, name: String) {
+            self.shortcuts.lock().unwrap().push(name);
+        }
     }
 
     struct DeskIface {
@@ -389,6 +528,9 @@ mod tests {
         _daemon: Daemon,
         server: Bus,
         state: Arc<Mutex<VdmState>>,
+        scripts: Arc<Mutex<Vec<String>>>,
+        shortcuts: Arc<Mutex<Vec<String>>>,
+        dir: crate::testdir::TestDir,
         address: String,
     }
 
@@ -396,6 +538,26 @@ mod tests {
         /// A fresh connection to the same private bus, for the Kwin under test.
         fn bus(&self) -> Bus {
             Bus::connect(&env(&self.address)).unwrap()
+        }
+
+        /// Where generated focus scripts are written.
+        fn script_dir(&self) -> PathBuf {
+            self.dir.to_path_buf()
+        }
+
+        /// The current virtual desktop position (as the VDM reports it).
+        fn current_position(&self) -> i64 {
+            self.state.lock().unwrap().current
+        }
+
+        /// The text of each script KWin was asked to load.
+        fn loaded_scripts(&self) -> Vec<String> {
+            self.scripts.lock().unwrap().clone()
+        }
+
+        /// The global shortcuts invoked.
+        fn invoked_shortcuts(&self) -> Vec<String> {
+            self.shortcuts.lock().unwrap().clone()
         }
 
         fn emit(&self, signal: &str) {
@@ -424,6 +586,27 @@ mod tests {
         }
     }
 
+    /// Serves the action side of the fake: KWin's scripting interface and the
+    /// global-shortcut component (both under `org.kde.KWin`'s scripting object and
+    /// the separate `org.kde.kglobalaccel` name).
+    fn serve_actions(
+        server: &Bus,
+        scripts: Arc<Mutex<Vec<String>>>,
+        shortcuts: Arc<Mutex<Vec<String>>>,
+    ) {
+        server
+            .connection()
+            .object_server()
+            .at(SCRIPTING_PATH, ScriptingIface { scripts })
+            .unwrap();
+        server.connection().request_name(KGLOBALACCEL).unwrap();
+        server
+            .connection()
+            .object_server()
+            .at(KGLOBALACCEL_PATH, ComponentIface { shortcuts })
+            .unwrap();
+    }
+
     /// A fake VDM on a private bus, with `desktops` (position, name) and `current`.
     fn fake_bus_with(desktops: &[(i64, &str)], current: i64) -> Fake {
         let d = daemon().expect("dbus-daemon on PATH");
@@ -432,6 +615,8 @@ mod tests {
             desktops: desktops.iter().map(|(p, n)| (*p, n.to_string())).collect(),
             current,
         }));
+        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let shortcuts = Arc::new(Mutex::new(Vec::new()));
         let server = Bus::connect(&env(&address)).unwrap();
         server
             .serve(
@@ -454,24 +639,36 @@ mod tests {
                 )
                 .unwrap();
         }
+        serve_actions(&server, Arc::clone(&scripts), Arc::clone(&shortcuts));
         Fake {
             _daemon: d,
             server,
             state,
+            scripts,
+            shortcuts,
+            dir: crate::testdir::new("kwin-fake"),
             address,
         }
     }
 
-    /// A bare private bus with no KWin at all (the script hasn't loaded yet).
+    /// A bare private bus with no running KWin (the desktop interface answers only
+    /// for the scripting/global-shortcut side).
     fn fake_bus() -> Fake {
         let d = daemon().expect("dbus-daemon on PATH");
         let address = d.address.clone();
         let state = Arc::new(Mutex::new(VdmState::default()));
+        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let shortcuts = Arc::new(Mutex::new(Vec::new()));
         let server = Bus::connect(&env(&address)).unwrap();
+        server.connection().request_name(DEST).unwrap();
+        serve_actions(&server, Arc::clone(&scripts), Arc::clone(&shortcuts));
         Fake {
             _daemon: d,
             server,
             state,
+            scripts,
+            shortcuts,
+            dir: crate::testdir::new("kwin-fake"),
             address,
         }
     }
@@ -502,6 +699,7 @@ mod tests {
     fn kwin_on(fake: &Fake) -> Kwin {
         let mut k = Kwin::new(None);
         k.attach(fake.bus()).unwrap();
+        k.script_dir = Some(fake.script_dir());
         k
     }
 
@@ -613,5 +811,29 @@ mod tests {
         for bad in ["", "two words", "line\nbreak", &"x".repeat(65)] {
             assert!(window_arg(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn tapping_a_capsule_writes_the_current_desktop() {
+        let fake = fake_bus_with(&[(1, "Uno"), (2, "Dos")], 1);
+        let k = kwin_on(&fake);
+        k.dispatch_workspace("2").unwrap();
+        assert_eq!(fake.current_position(), 2);
+    }
+
+    #[test]
+    fn tapping_a_window_icon_loads_a_script_that_focuses_it() {
+        let fake = fake_bus();
+        let k = kwin_on(&fake);
+        k.dispatch_focus_window("a2").unwrap();
+        assert!(fake.loaded_scripts().iter().any(|s| s.contains("a2")));
+    }
+
+    #[test]
+    fn the_overview_drag_invokes_the_overview_shortcut() {
+        let fake = fake_bus();
+        let k = kwin_on(&fake);
+        k.overview().unwrap();
+        assert_eq!(fake.invoked_shortcuts(), vec!["Overview"]);
     }
 }
